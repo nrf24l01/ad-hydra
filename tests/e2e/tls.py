@@ -200,8 +200,10 @@ class Tls(unittest.TestCase):
                 (tmp / 'second').mkdir()
                 second_certificate, second_key = self_signed(tmp / 'second')
                 self.assertNotEqual(second_certificate, certificate)
+                # Read the revision instead of assuming one: the earlier PATCH moved it.
+                revision = good('GET', '/services', token=token)['revision']
                 good('PATCH', f'/services/{created["id"]}', {
-                    'expected_revision': 1, 'transport': 'tcp',
+                    'expected_revision': revision, 'transport': 'tcp',
                     'listen_address': f'127.0.0.1:{pp}',
                     'upstream_address': f'127.0.0.1:{backend.getsockname()[1]}',
                     'protocol_id': 'raw', 'enabled': True,
@@ -211,7 +213,7 @@ class Tls(unittest.TestCase):
                             'server_name': 'localhost'}}, token)
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
-                    if good('GET', '/system/proxy', token=token)['applied_services_revision'] == 2:
+                    if good('GET', '/system/proxy', token=token)['applied_services_revision'] == revision + 1:
                         break
                     time.sleep(.05)
                 with socket.create_connection(('127.0.0.1', pp), timeout=5) as raw:
