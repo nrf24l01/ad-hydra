@@ -1,12 +1,14 @@
 //! Bounded decoders; decoding never owns or edits transport buffers.
 mod decoder;
 mod framing;
+mod grpc;
 mod http;
 mod http_response;
 mod raw;
 mod utf8;
 pub use decoder::ProtocolDecoder;
 pub use framing::FramingDecoder;
+pub use grpc::{GrpcDecoder, MAX_FRAME_BODY, MAX_MESSAGE_BODY};
 mod wasm;
 pub use http::{HttpBatch, HttpDecoder, HttpRequest};
 pub use hydra_protocol_sdk::{Direction, ParsedMessage, Value};
@@ -24,6 +26,7 @@ impl std::error::Error for DecodeError {}
 pub enum SessionDecoder {
     Raw(RawDecoder),
     Framing(FramingDecoder),
+    Grpc(GrpcDecoder),
     Http(HttpDecoder),
     Utf8(Utf8Decoder),
     Wasm(Box<WasmSession>),
@@ -36,6 +39,7 @@ impl SessionDecoder {
     ) -> Result<Vec<ParsedMessage>, DecodeError> {
         match self {
             Self::Framing(d) => ProtocolDecoder::feed(d, direction, bytes),
+            Self::Grpc(d) => ProtocolDecoder::feed(d, direction, bytes),
             Self::Raw(d) => ProtocolDecoder::feed(d, direction, bytes),
             Self::Http(d) => ProtocolDecoder::feed(d, direction, bytes),
             Self::Utf8(d) => ProtocolDecoder::feed(d, direction, bytes),
@@ -47,6 +51,7 @@ impl SessionDecoder {
         match self {
             Self::Raw(d) => d.field_schema(),
             Self::Framing(d) => d.field_schema(),
+            Self::Grpc(d) => d.field_schema(),
             Self::Http(d) => d.field_schema(),
             Self::Utf8(d) => d.field_schema(),
             Self::Wasm(d) => d.field_schema(),

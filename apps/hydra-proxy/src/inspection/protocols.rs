@@ -56,6 +56,7 @@ impl ProtocolSession {
             SessionDecoder::Raw(_)
                 | SessionDecoder::Wasm(_)
                 | SessionDecoder::Framing(_)
+                | SessionDecoder::Grpc(_)
                 | SessionDecoder::Utf8(_)
         )
     }
@@ -389,6 +390,9 @@ impl Protocols {
         } else {
             let decoder = match protocol_id {
                 "http" | "http1" | "http1.1" => SessionDecoder::Http(HttpDecoder::default()),
+                "grpc" | "h2" | "grpc-h2" => {
+                    SessionDecoder::Grpc(hydra_protocol_runtime::GrpcDecoder::default())
+                }
                 "utf8" | "utf-8" | "text" => {
                     SessionDecoder::Utf8(hydra_protocol_runtime::Utf8Decoder::default())
                 }
@@ -584,6 +588,26 @@ mod tests {
         ));
         fs::remove_dir_all(directory).unwrap();
     }
+    #[tokio::test]
+    async fn grpc_profile_resolves_to_the_native_stream_decoder() {
+        let directory = std::env::temp_dir().join(format!("hydra-grpc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let protocols = Protocols::open(&directory).await.unwrap();
+        for id in ["grpc", "h2", "grpc-h2"] {
+            let mut session = protocols.session("svc", id).unwrap();
+            assert!(session.is_stream_decoder(), "{id}");
+            assert!(session.http_mut().is_none(), "{id}");
+            // One DATA frame carrying one length-prefixed gRPC message.
+            let mut frame = vec![0, 0, 8, 0, 0, 0, 0, 0, 1];
+            frame.extend_from_slice(&[0, 0, 0, 0, 3]);
+            frame.extend_from_slice(b"abc");
+            let messages = session.feed(Direction::ClientToServer, &frame).unwrap();
+            assert_eq!(messages.len(), 1, "{id}");
+            assert_eq!(messages[0].protocol, "grpc", "{id}");
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[tokio::test]
     async fn persistence_permissions_sessions_and_immutable_versions() {
         let directory =

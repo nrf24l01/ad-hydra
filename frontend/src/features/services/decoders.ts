@@ -3,7 +3,7 @@ import { api, activateProtocol } from '@/shared/api/client'
 export type DecoderVersion = { id:string; version:string; state:string; error?:string|null; profile?:unknown }
 export type DecoderActivation = { service_id:string; id:string; version:string; applied:boolean; error?:string|null }
 export type DecoderCatalog = { items:DecoderVersion[]; activations:DecoderActivation[] }
-export const builtins = [{value:'raw',label:'Raw bytes (hex)'},{value:'utf8',label:'UTF-8 text'},{value:'http',label:'HTTP/1.1'}]
+export const builtins = [{value:'raw',label:'Raw bytes (hex)'},{value:'utf8',label:'UTF-8 text'},{value:'http',label:'HTTP/1.1'},{value:'grpc',label:'gRPC over HTTP/2'}]
 export function decoderValue(id:string,version:string):string { return `custom:${id}/${version}` }
 export function decoderChoices(catalog:DecoderCatalog) {
  return [...builtins,...catalog.items.filter(item=>item.state==='installed').map(item=>({value:decoderValue(item.id,item.version),label:`${item.id} / ${item.version} · ${item.profile?'framing':'WASM'}`}))]
