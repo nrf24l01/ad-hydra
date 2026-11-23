@@ -4,6 +4,21 @@
 
 The final **Publish latest Linux binaries to S3** job depends on successful verification. Set the repository Actions variable `HYDRA_PUBLISH_S3` to `true` to enable publication on main pushes and manual main dispatches. It downloads the artifact from that exact run, checks the current main SHA, and skips superseded builds. Publication is serialized; an in-progress upload is not canceled by a newer run.
 
+## Public GitHub releases and installer sources
+
+After verification, **Publish public GitHub install archive** runs on main pushes and manual main dispatches. It checks that the build is still main's current commit, serializes publication, and replaces the moving `hydra-latest` release with `hydra-linux-x86_64-musl.tar.gz`. The archive contains both binaries, `SHA256SUMS` and `BUILD.txt` (commit and target). Actions artifacts retain the build-specific SHA in their names for 30 days; the public release is a moving latest build, not an immutable history of releases.
+
+The installer accepts these sources:
+
+| Option | Download and authorization |
+| --- | --- |
+| `--source github` | Full archive from the public release; no token |
+| `--source github-auth` | Verified Actions artifact ZIP; Actions-read token |
+| `--source s3` | Two binary objects with integrity metadata; stdin credentials; default source |
+| `--archive PATH` | Already downloaded Actions ZIP or release tar archive |
+
+See [installation](INSTALL.md) for full commands and recovery. S3 is optional and a skipped S3 job does not mean the public release failed. Its enabling variable and secrets must be configured separately; never put their values in source control.
+
 ## Build caches
 
 The verification runner is pinned to Ubuntu24.04. Caches cover:

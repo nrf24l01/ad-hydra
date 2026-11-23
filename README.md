@@ -95,6 +95,8 @@ cargo build --locked --workspace
 
 ## Further reading
 
+- [Documentation index](docs/README.md), [developer setup](docs/DEVELOPMENT.md), and [current development handoff](docs/HANDOFF.md)
+
 - [Traffic viewer](docs/traffic-view.md) and [service limits and favourites](docs/traffic-protection.md)
 - [Python and WASM request checkers](docs/REQUEST_CHECKERS.md)
 - [Writing Python exploits for Farm](docs/exploits-python.ru.md) (in Russian)

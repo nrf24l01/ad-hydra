@@ -1,6 +1,12 @@
 # Hydra implementation ledger
 
-Authority: SPEC.md. Delivery order: IMPLEMENTATION_PLAN.md. Original repository contained untracked handoff documents and no executable implementation; those documents were preserved. Work remains uncommitted in the supplied workspace.
+Authority: SPEC.md. Delivery order: IMPLEMENTATION_PLAN.md. This is a historical milestone ledger. Older paragraphs describe behavior at the time and may be superseded. Use [the current handoff](docs/HANDOFF.md) for continuation and [the documentation index](docs/README.md) to find feature guides.
+
+## Documentation handoff — 2026-11-23
+
+Reviewed the existing guides against the current source at `7629be1`. Added a developer guide, current implementation/limitations handoff and documentation index; replaced the obsolete Phase 0 starter prompt. Updated verification build order, TLS/filter configuration, frontend history wording, release distribution and deployment storage guidance. Documented the host runner’s actual shared HOME/cache persistence and temporary run directory; a dedicated per-exploit state mount is a remaining implementation gap. This change documents existing behavior; it adds no runtime feature.
+
+Last recorded successful CI: [44873454868](https://github.com/nrf24l01/ad-hydra/actions/runs/44873454868), 2026-11-21, commit `7629be1`; see the handoff for coverage and publication caveats. Documentation validation results are reported with this change; application tests are not rerun for prose edits.
 
 ## Latest milestone — 2026-10-22
 

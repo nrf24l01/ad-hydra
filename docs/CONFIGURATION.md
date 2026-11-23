@@ -30,11 +30,11 @@ Send a regular request to the listener using the service's normal client. Open *
 | Raw | Unknown or binary protocols. Inspect captured bytes in hex. |
 | Custom WASM | Protocols with a decoder you upload under **Protocols** and select in **Services**. |
 
-Encrypted traffic stays encrypted. Use a trusted point where plaintext is available if you need decoded fields. See the [WASM decoder guide](CUSTOM_DECODERS.md) and [Traffic Explorer guide](traffic-view.md).
+For TLS passthrough, traffic remains encrypted. To inspect HTTPS, edit a TCP service and enable TLS termination with a PEM certificate chain and its matching private key, then choose the HTTP decoder. Clients must trust that certificate. Enable upstream TLS separately when the backend also expects TLS; set its server name for verification. Insecure upstream verification is an explicit option for self-signed competition backends. Certificate updates apply to new connections without restarting Proxy; existing connections keep their negotiated TLS session. ALPN offers HTTP/1.1 only. Private keys are not returned by the API or configuration export, so retain them in your private deployment backup. Adding a certificate cannot decrypt old saved sessions. See the [WASM decoder guide](CUSTOM_DECODERS.md) and [Traffic Explorer guide](traffic-view.md).
 
 ## 3. Create a defensive filter
 
-In **Filters → Add filter**, choose the service and add a condition. For example, on your HTTP test service, choose **Client → server**, **HTTP path**, **equals**, and enter `/blocked-demo`. Choose **Block HTTP request** as the action. Field choices depend on the selected service's decoder. Use nested **AND** and **OR** groups to combine conditions.
+In **Filters → Add filter**, choose the service. The default form matches a regex against the raw stream text window; choose **Advanced expression** for decoder fields and nested groups, and give the filter a name. For example, on your HTTP test service, choose **Client → server**, **HTTP path**, **equals**, and enter `/blocked-demo`. Choose **Block HTTP request** as the action. Field choices depend on the selected service's decoder. Use nested **AND** and **OR** groups to combine conditions.
 
 Choose **Shadow** to count matches while letting requests through. You can also preview the rule on saved traffic from your service. When you choose **Enforce**, an enabled rule applies as soon as Proxy acknowledges the new revision. Check the rule card for the applied status and hit count. To see a blocked conversation in **Traffic**, select **Show blocked**.
 

@@ -77,7 +77,7 @@ ssh -L 8080:127.0.0.1:8080 root@YOUR_MACHINE
 
 Accept the generated certificate for your own machine. Configure Services with each listener/upstream pair, choose its decoder and enable it. Configure authorized Farm teams explicitly. Competition service applications are installed separately; this script installs Hydra itself. Swagger is at `/docs/`.
 
-Python execution uses pinned `uv` (installed if absent). Host execution remains an explicit Settings choice; the initial mode requires sandbox configuration before exploit execution. No submission destination or flag regex is invented.
+Python execution uses pinned `uv` (installed if absent). Host execution remains an explicit Settings choice; the initial mode requires sandbox configuration before exploit execution. No submission destination is preconfigured. The default flag pattern is ForcAD’s `[A-Z0-9]{31}=`; configure another pattern when the competition differs.
 
 ## Upgrade and recovery
 

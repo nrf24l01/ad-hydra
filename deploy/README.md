@@ -27,7 +27,7 @@ systemctl enable --now hydra-proxy.service hydra-core.service
 
 Do not enable exploit execution until a writable cgroup subtree with cpu/memory/pids controllers has been delegated and provisioned. These baseline units deliberately leave operations sandbox configuration null. A supported deployment must place Core in a supervisor leaf, enable the delegated subtree controllers outside the application, allow unprivileged user namespaces, and grant Core write access to its own job subtree. Set a short private runtime directory such as `/run/hydra-core/jobs` (create0700). Consult `docs/sandbox-integration.md`; setting a path in JSON alone does not establish delegation. Missing prerequisites produce failed runs.
 
-Stop Core for backup, then archive the whole `/var/lib/hydra-core` directory preserving modes/ownership. Archive `/var/lib/hydra-proxy` separately. Core signing key and flag database are secrets. Restore matching state/key files together; do not replace Proxy state while it is running. Proxy's private directory includes completed gzip stream-history records and one-shot samples; keep its owner/mode intact. In-progress history is held in memory and is not recovered after restart. A normal Proxy restart preserves completed history.
+Stop Core for backup, then archive the whole `/var/lib/hydra-core` directory preserving modes/ownership. Archive `/var/lib/hydra-proxy` separately. Core signing key and flag database are secrets. Restore matching state/key files together; do not replace Proxy state while it is running. Proxy's private directory includes completed zstd stream-history records (and backward-readable legacy gzip records) and one-shot samples; keep its owner/mode intact. In-progress history is held in memory and is not recovered after restart. A normal Proxy restart preserves completed history.
 
 For Python workers install a trusted `uv` release, system Python and CA certificates.
 Set `sandbox.uv` to its absolute executable path if it is not `/usr/bin/uv`. First-run
@@ -38,4 +38,8 @@ and provision a filesystem quota if a hard disk cap is required. See
 [Python preparation limits](../docs/sandbox-integration.md#python-packages-and-uv).
 
 ## Farm host runner
+
+Host execution is an explicit alternative to the default sandbox mode. Configure it as described in [Farm](../docs/farm.md#host-process-execution); host jobs run with Core's OS-user and systemd permissions. Python uses uv, a persistent host-runner home/cache and a temporary run directory. See the Farm guide for the actual storage scope. Traffic checkers are a separate Proxy feature with their own networkless `/state` mounts; see [request checker storage](../docs/REQUEST_CHECKERS.md#where-files-are-stored).
+
+The [installer guide](../docs/INSTALL.md) is the reference for standard generated units and `/etc/hydra/core-settings/operations.json`. The hand-installed example above deliberately uses `/etc/hydra/operations.json`; always inspect the active unit arguments to find the effective path before backup or recovery.
 

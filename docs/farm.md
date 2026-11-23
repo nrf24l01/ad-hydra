@@ -46,6 +46,19 @@ Merge these fields with the existing flag/checker settings. The work directory m
 
 The previous sandbox runner remains available with `execution_mode: "sandbox"` (the default when omitted). Host mode is an explicit product change requested for this deployment, not an automatic fallback when sandbox setup fails. The API accepts configured team IDs, never a hostname or arbitrary IP supplied to a run request. Queued runs snapshot team IP/service port; disabling or changing an endpoint before launch rejects that queued run. Host programs themselves have ordinary host network access.
 
+## Host runner files and persistence
+
+The current host runner creates these directories under `host_runtime.work_dir`:
+
+| Path | Lifetime |
+| --- | --- |
+| `run-<random UUID>/` | Temporary working directory containing the copied entrypoint and optional targets file; removed when the run finishes |
+| `home/` | Persistent `HOME`, shared by host jobs using this runtime directory |
+| `uv-cache/` | Persistent uv package cache, shared by those jobs |
+| `home/python/` | Persistent uv Python installation directory |
+
+Ordinary relative-path writes land in the temporary run directory and are removed after completion. A host job can retain ordinary files under its `HOME`; those files belong to Core's OS user and are shared across jobs, not isolated per checker/exploit. The host runner currently provides no dedicated per-exploit `/state` mount. Back up the configured work directory if its home/cache contents matter. Traffic-filter workers have a different, per-checker persistent `/state` mount documented in [request checkers](REQUEST_CHECKERS.md#where-files-are-stored).
+
 ## Logs and rotation
 
 Open Logs beside any run. Stdout and stderr are separate readable streams with target labels, state, timestamps, and exit code. The open view refreshes while execution runs. Host output is persisted approximately every300ms. Log payloads are stored as **zstd BLOBs** in Core's private SQLite database; the API decompresses bounded output for display. New logs clear the old plaintext columns. Completed legacy plaintext logs are converted in batches of up to64 records at startup and during periodic retention maintenance. Existing active plaintext records are not modified by that conversion.
