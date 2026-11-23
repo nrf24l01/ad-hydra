@@ -10,6 +10,9 @@ export class ApiError extends Error {
   constructor(message: string, public status: number, public requestId?: string) { super(message) }
 }
 export function clear(): void { token = ''; expires = 0 }
+/** Access token for in-band WebSocket auth. Never put this value in a URL. */
+export function accessToken(): string { return token }
+export function accessTokenFresh(withinMs = 5000): boolean { return Boolean(token) && Date.now() <= expires - withinMs }
 function remember(value: unknown): void {
   if (!value || typeof value !== 'object' || !('access_token' in value) || typeof value.access_token !== 'string' || !('expires_in' in value) || typeof value.expires_in !== 'number') throw new Error('Invalid sign-in response')
   token = value.access_token; expires = Date.now() + value.expires_in * 1000

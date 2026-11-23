@@ -174,6 +174,12 @@ pub async fn run() -> anyhow::Result<()> {
             let settings_state =
                 crate::modules::settings::Settings::new(auth.clone(), settings_view, operations)?
                     .with_history_policy(history_policy, view.clone());
+            // Migration ordering is a product invariant, not an SQL workaround:
+            // `Flags::open` applies 0018, which rebuilds `flag_events`. The
+            // favorites triggers created by `Traffic::open` (0024/0025) reference
+            // `flag_events`, so opening Traffic first leaves a fresh database
+            // with triggers pointing at the table 0018 is about to drop/rename.
+            // Keep Flags before Traffic on every serve/bootstrap path.
             let flags = crate::modules::flags::Flags::open(auth.clone(), settings.flags()).await?;
             let farm = crate::modules::farm::Farm::open(
                 auth.clone(),
@@ -191,7 +197,12 @@ pub async fn run() -> anyhow::Result<()> {
             )
             .await?;
             let control = Control::open(auth.clone()).await?;
-            let traffic = crate::modules::traffic::Traffic::open(auth.clone()).await?;
+            let traffic = crate::modules::traffic::Traffic::open(auth.clone())
+                .await?
+                .with_runtime(args.socket.clone(), settings.flag_pattern.clone());
+            // Attach live traffic after both modules have migrated so the
+            // settings save path can refresh the highlight pattern in place.
+            let settings_state = settings_state.with_traffic(traffic.clone());
             if let Some(snapshot) = snapshot.as_ref() {
                 control.seed_snapshot(snapshot.clone()).await?;
             }

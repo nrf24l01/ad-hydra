@@ -3,13 +3,99 @@ use hydra_wire::v1::{self as proto, event::Payload};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use tokio::sync::{Semaphore, broadcast};
 #[derive(Clone)]
 pub struct Traffic {
     pub(crate) auth: AuthState,
     pub(crate) events: broadcast::Sender<Value>,
     pub(crate) streams: Arc<Semaphore>,
+    pub(crate) searches: Arc<Semaphore>,
+    pub(crate) live: Arc<LiveSockets>,
+    runtime: Arc<Runtime>,
+}
+/// Process-local, traffic-owned (never a static) socket accounting.
+#[derive(Default)]
+pub struct LiveSockets {
+    actors: Mutex<HashMap<String, u8>>,
+    open: AtomicU64,
+    peak: AtomicU64,
+    dropped: AtomicU64,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LiveCounters {
+    pub open: u64,
+    pub peak: u64,
+    pub dropped: u64,
+}
+impl LiveSockets {
+    const PER_ACTOR: u8 = 2;
+    const MAX_ACTORS: usize = 128;
+    /// Acquire one per-actor socket slot; the returned lease releases on drop.
+    pub(crate) fn acquire(self: &Arc<Self>, actor: &str) -> Option<LiveLease> {
+        if actor.is_empty() || actor.len() > 128 {
+            return None;
+        }
+        let mut actors = self.actors.lock().ok()?;
+        if !actors.contains_key(actor) && actors.len() >= Self::MAX_ACTORS {
+            return None;
+        }
+        let slot = actors.entry(actor.to_owned()).or_insert(0);
+        if *slot >= Self::PER_ACTOR {
+            return None;
+        }
+        *slot += 1;
+        let open = self.open.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(open, Ordering::Relaxed);
+        Some(LiveLease {
+            sockets: self.clone(),
+            actor: actor.to_owned(),
+        })
+    }
+    fn release(&self, actor: &str) {
+        if let Ok(mut actors) = self.actors.lock()
+            && let Some(slot) = actors.get_mut(actor)
+        {
+            *slot = slot.saturating_sub(1);
+            if *slot == 0 {
+                actors.remove(actor);
+            }
+        }
+        self.open.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub fn counters(&self) -> LiveCounters {
+        LiveCounters {
+            open: self.open.load(Ordering::Relaxed),
+            peak: self.peak.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+        }
+    }
+    pub(crate) fn record_dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+pub(crate) struct LiveLease {
+    sockets: Arc<LiveSockets>,
+    actor: String,
+}
+impl Drop for LiveLease {
+    fn drop(&mut self) {
+        self.sockets.release(&self.actor);
+    }
+}
+#[derive(Default)]
+struct Runtime {
+    socket: Option<PathBuf>,
+    /// Compiled highlight regex. Refreshed by the settings save path so a
+    /// runtime `flag_pattern` change applies without a Core restart.
+    highlight: RwLock<Option<regex::Regex>>,
 }
 #[derive(Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in=Query)]
@@ -77,8 +163,52 @@ impl Traffic {
         Ok(Self {
             auth,
             events,
-            streams: Arc::new(Semaphore::new(8)),
+            // 16 shared SSE+WS permits; per-actor cap is enforced by `live`.
+            streams: Arc::new(Semaphore::new(16)),
+            searches: Arc::new(Semaphore::new(2)),
+            live: Arc::new(LiveSockets::default()),
+            runtime: Arc::new(Runtime::default()),
         })
+    }
+    /// Attach process wiring used by Streams (Proxy socket and highlight pattern).
+    pub fn with_runtime(
+        mut self,
+        socket: impl Into<PathBuf>,
+        flag_pattern: Option<String>,
+    ) -> Self {
+        let highlight = super::text::compile_pattern(flag_pattern.as_deref());
+        self.runtime = Arc::new(Runtime {
+            socket: Some(socket.into()),
+            highlight: RwLock::new(highlight),
+        });
+        self
+    }
+    /// Test-only view of the configured highlight source. Reads the compiled
+    /// runtime regex so a settings refresh is reflected instead of a stale
+    /// duplicate of the startup string.
+    #[cfg(test)]
+    pub(crate) fn flag_pattern(&self) -> Option<String> {
+        self.highlight().map(|pattern| pattern.as_str().to_owned())
+    }
+    /// Compiled configured highlight pattern; `None` means highlighting is unavailable.
+    /// Cloned so callers never hold the lock across a frame.
+    pub(crate) fn highlight(&self) -> Option<regex::Regex> {
+        self.runtime
+            .highlight
+            .read()
+            .ok()
+            .and_then(|pattern| pattern.clone())
+    }
+    /// Recompile the highlight pattern after a settings save. An invalid pattern
+    /// disables highlighting instead of keeping the stale one.
+    pub(crate) fn refresh_flag_pattern(&self, pattern: Option<&str>) {
+        let compiled = super::text::compile_pattern(pattern);
+        if let Ok(mut slot) = self.runtime.highlight.write() {
+            *slot = compiled;
+        }
+    }
+    pub(crate) fn proxy_socket(&self) -> Option<&std::path::Path> {
+        self.runtime.socket.as_deref()
     }
     /// Redacted metadata only; called after durable critical finding commit.
     pub fn flag_detected(&self, flow: &str, service: &str) {
@@ -125,8 +255,10 @@ impl Traffic {
     published.push(data);
    }
    super::retention::enforce(&tx, super::retention::SERVICE_BYTES)?;
-   // A critical finding or hit may arrive before the normal opening event.
    // Hydrate lifecycle notifications from committed indexes to preserve that state.
+   // Keep this to lifecycle kinds only: `message` events are also the canonical SSE
+   // payload and must stay byte-identical to `message()` readback. Streams derives
+   // message-level visibility in its own filter/reconciliation path instead.
    for data in &mut published {
     if matches!(data["kind"].as_str(), Some("flow_opened" | "flow_closed")) {
      let sql=format!("SELECT {},EXISTS(SELECT 1 FROM flag_events WHERE flow_id=?1)",super::visibility::blocked_sql("?1",None));
@@ -148,53 +280,8 @@ impl Traffic {
         self.list(q, Some(flow)).await
     }
     async fn list(&self, q: Query, flow: Option<String>) -> anyhow::Result<Page> {
+        validate_query(&q)?;
         let limit = q.limit.unwrap_or(50);
-        anyhow::ensure!(
-            (1..=100).contains(&limit) && q.after.unwrap_or(0) >= 0,
-            "invalid pagination"
-        );
-        anyhow::ensure!(
-            q.service_id.as_ref().is_none_or(|s| s.len() <= 128)
-                && q.client_ip.as_ref().is_none_or(|s| s.len() <= 64),
-            "invalid filter"
-        );
-        anyhow::ensure!(
-            q.since_ms.zip(q.until_ms).is_none_or(|(a, b)| a <= b),
-            "invalid time range"
-        );
-        anyhow::ensure!(
-            q.transport.is_none_or(|v| (1..=2).contains(&v))
-                && q.direction.is_none_or(|v| (1..=2).contains(&v)),
-            "invalid transport or direction"
-        );
-        for value in [
-            &q.source_ip,
-            &q.destination_ip,
-            &q.field_path,
-            &q.matched_rule,
-        ] {
-            anyhow::ensure!(
-                value
-                    .as_ref()
-                    .is_none_or(|v| !v.is_empty() && v.len() <= 128),
-                "invalid filter"
-            );
-        }
-        anyhow::ensure!(
-            q.field_path
-                .as_ref()
-                .is_none_or(|v| v.split('.').count() <= 16)
-                && q.field_value.as_ref().is_none_or(|v| v.len() <= 1024)
-                && (q.field_value.is_none() || q.field_path.is_some()),
-            "invalid field query"
-        );
-        anyhow::ensure!(
-            q.client_ip
-                .as_ref()
-                .zip(q.source_ip.as_ref())
-                .is_none_or(|(a, b)| a == b),
-            "conflicting source filters"
-        );
         self.auth.db.run(move |db| {
             use rusqlite::types::Value as Sql;
             let messages=flow.is_some();
@@ -203,41 +290,17 @@ impl Traffic {
             let newest = q.newest_first.unwrap_or(false);
             let comparison = if newest { "<" } else { ">" };
             let blocked=super::visibility::blocked_sql(flow_ref, messages.then_some("t.id"));
-            let flagged=format!("(EXISTS(SELECT 1 FROM flag_events fe WHERE fe.flow_id={flow_ref}) OR EXISTS(SELECT 1 FROM traffic_favorites WHERE flow_id={flow_ref} AND has_flag=1))");
             let favorite=format!("EXISTS(SELECT 1 FROM traffic_favorites WHERE flow_id={flow_ref})");
+            let flagged=format!("(EXISTS(SELECT 1 FROM flag_events fe WHERE fe.flow_id={flow_ref}) OR EXISTS(SELECT 1 FROM traffic_favorites WHERE flow_id={flow_ref} AND has_flag=1))");
             let raw_history=format!("COALESCE((SELECT raw_history_state FROM traffic_favorites WHERE flow_id={flow_ref}),'not_saved')");
             let incomplete=format!("EXISTS(SELECT 1 FROM traffic_favorites WHERE flow_id={flow_ref} AND decoded_incomplete=1)");
             let incomplete=if messages {incomplete}else{format!("({incomplete} OR COALESCE(json_extract(t.data,'$.decoded_incomplete'),0)=1)")};
-            let ordered=if messages {"'$.stream_sequence',t.seq,"} else {""};
+            let ordered=if messages {"'$.stream_sequence',t.seq,"} else {"'$.seq',t.seq,"};
             let mut sql=format!("SELECT t.seq,json_set(t.data,{ordered}'$.favorite',json(CASE WHEN {favorite} THEN 'true' ELSE 'false' END),'$.raw_history_state',{raw_history},'$.decoded_incomplete',json(CASE WHEN {incomplete} THEN 'true' ELSE 'false' END),'$.blocked',json(CASE WHEN {blocked} THEN 'true' ELSE 'false' END),'$.has_flag',json(CASE WHEN {flagged} THEN 'true' ELSE 'false' END)) FROM {table} t WHERE t.seq{comparison}?");
-            if let Some(favorite_filter)=q.favorite {sql.push_str(&format!(" AND {}({favorite})",if favorite_filter {""}else{"NOT "}));}
-            if q.include_blocked == Some(false) { sql.push_str(&format!(" AND NOT ({blocked})")); }
-            let mut values=vec![Sql::Integer(q.after.unwrap_or(if newest {i64::MAX}else{0}))];
-            { let mut add=|clause:&str,value:Sql| {sql.push_str(clause);values.push(value);};
-            if let Some(v)=flow {add(" AND t.flow_id=?",v.into());}
-            if let Some(v)=q.service_id {add(" AND t.service_id=?",v.into());}
-            if let Some(v)=q.since_ms {add(" AND t.occurred_ms>=?",v.into());}
-            if let Some(v)=q.until_ms {add(" AND t.occurred_ms<=?",v.into());}
-            // Endpoint predicates refer to the indexed opening flow, not a guessed message direction.
-            if let Some(v)=q.client_ip.or(q.source_ip) {add(&if messages {format!(" AND EXISTS(SELECT 1 FROM traffic_flows f WHERE f.id={flow_ref} AND f.client_ip=?)")}else{" AND t.client_ip=?".into()},v.into());}
-            if let Some(v)=q.destination_ip {add(&if messages {format!(" AND EXISTS(SELECT 1 FROM traffic_flows f WHERE f.id={flow_ref} AND json_extract(f.data,'$.upstream.ip')=?)")}else{" AND json_extract(t.data,'$.upstream.ip')=?".into()},v.into());}
-            if let Some(v)=q.transport {add(&if messages {format!(" AND EXISTS(SELECT 1 FROM traffic_flows f WHERE f.id={flow_ref} AND json_extract(f.data,'$.transport')=?)")}else{" AND json_extract(t.data,'$.transport')=?".into()},Sql::Integer(v.into()));}
-            if let Some(v)=q.matched_rule {add(&format!(" AND EXISTS(SELECT 1 FROM traffic_events e WHERE e.flow_id={flow_ref} AND e.kind='rule_hit' AND json_extract(e.data,'$.rule_id')=?)"),v.into());}
-            }
-            if let Some(v)=q.has_flag {
-                sql.push_str(&format!(" AND {}(EXISTS(SELECT 1 FROM flag_events fe WHERE fe.flow_id={flow_ref}) OR EXISTS(SELECT 1 FROM traffic_favorites WHERE flow_id={flow_ref} AND has_flag=1))",if v {""}else{"NOT "}));
-            }
-            if q.direction.is_some() || q.field_path.is_some() {
-                let predicate=if messages {"m.id=t.id".to_owned()}else{"m.flow_id=t.id".to_owned()};
-                sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM traffic_messages m WHERE {predicate}"));
-                if let Some(v)=q.direction {sql.push_str(" AND json_extract(m.data,'$.direction')=?");values.push(Sql::Integer(v.into()));}
-                if let Some(v)=q.field_path {
-                    sql.push_str(" AND EXISTS(SELECT 1 FROM json_each(m.data,'$.fields') field WHERE field.key=?");values.push(v.into());
-                    if let Some(v)=q.field_value {sql.push_str(" AND CAST(json_extract(field.value,'$.value') AS TEXT)=?");values.push(v.into());}
-                    sql.push(')');
-                }
-                sql.push(')');
-            }
+            let (clauses, mut values) = filter_sql(&q, messages, flow_ref);
+            sql.push_str(&clauses);
+            values.insert(0, Sql::Integer(q.after.unwrap_or(if newest {i64::MAX}else{0})));
+            if let Some(v)=flow {sql.push_str(" AND t.flow_id=?");values.push(v.into());}
             sql.push_str(if newest {" ORDER BY t.seq DESC LIMIT ?"}else{" ORDER BY t.seq LIMIT ?"});values.push(Sql::Integer((limit+1) as i64));
             let mut stmt=db.prepare(&sql)?;
             let rows=stmt.query_map(rusqlite::params_from_iter(values),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
@@ -245,6 +308,31 @@ impl Traffic {
             let items=rows.into_iter().take(limit).map(|(_,data)|serde_json::from_str(&data)).collect::<Result<Vec<_>,_>>()?;
             Ok(Page{items,next_cursor})
         }).await
+    }
+
+    /// Evaluate every non-pagination filter for one flow id. Used to reconcile
+    /// unhydrated live events (favorite/blocked/advanced filters) against the
+    /// committed indexes, so a filtered subscription neither drops all
+    /// favorited events nor leaks out-of-scope flows.
+    pub(crate) async fn flow_matches(&self, q: Query, flow_id: String) -> anyhow::Result<bool> {
+        validate_query(&q)?;
+        anyhow::ensure!(
+            !flow_id.is_empty() && flow_id.len() <= 128,
+            "invalid flow id"
+        );
+        self.auth
+            .db
+            .run(move |db| {
+                use rusqlite::types::Value as Sql;
+                let (clauses, mut values) = filter_sql(&q, false, "t.id");
+                values.insert(0, Sql::Text(flow_id));
+                let sql =
+                    format!("SELECT EXISTS(SELECT 1 FROM traffic_flows t WHERE t.id=?{clauses})");
+                Ok(db.query_row(&sql, rusqlite::params_from_iter(values), |r| {
+                    r.get::<_, bool>(0)
+                })?)
+            })
+            .await
     }
 
     pub async fn flow(&self, id: String) -> anyhow::Result<Option<Value>> {
@@ -322,6 +410,161 @@ impl Traffic {
             .await
     }
 }
+/// Shared validation for the HTTP list filters and the Streams live query.
+/// One implementation so a subscription cannot accept a filter the snapshot
+/// query would reject (or vice versa).
+pub(crate) fn validate_query(q: &Query) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=100).contains(&q.limit.unwrap_or(50)) && q.after.unwrap_or(0) >= 0,
+        "invalid pagination"
+    );
+    anyhow::ensure!(
+        q.service_id.as_ref().is_none_or(|s| s.len() <= 128)
+            && q.client_ip.as_ref().is_none_or(|s| s.len() <= 64),
+        "invalid filter"
+    );
+    anyhow::ensure!(
+        q.since_ms.zip(q.until_ms).is_none_or(|(a, b)| a <= b),
+        "invalid time range"
+    );
+    anyhow::ensure!(
+        q.transport.is_none_or(|v| (1..=2).contains(&v))
+            && q.direction.is_none_or(|v| (1..=2).contains(&v)),
+        "invalid transport or direction"
+    );
+    for value in [
+        &q.source_ip,
+        &q.destination_ip,
+        &q.field_path,
+        &q.matched_rule,
+    ] {
+        anyhow::ensure!(
+            value
+                .as_ref()
+                .is_none_or(|v| !v.is_empty() && v.len() <= 128),
+            "invalid filter"
+        );
+    }
+    anyhow::ensure!(
+        q.field_path
+            .as_ref()
+            .is_none_or(|v| v.split('.').count() <= 16)
+            && q.field_value.as_ref().is_none_or(|v| v.len() <= 1024)
+            && (q.field_value.is_none() || q.field_path.is_some()),
+        "invalid field query"
+    );
+    anyhow::ensure!(
+        q.client_ip
+            .as_ref()
+            .zip(q.source_ip.as_ref())
+            .is_none_or(|(a, b)| a == b),
+        "conflicting source filters"
+    );
+    Ok(())
+}
+
+/// SQL predicates for every non-pagination filter, shared by paging and by
+/// single-flow live-event reconciliation. `messages` selects message-table
+/// endpoint semantics; `flow_ref` is the column that identifies the flow.
+pub(crate) fn filter_sql(
+    q: &Query,
+    messages: bool,
+    flow_ref: &str,
+) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value as Sql;
+    let blocked = super::visibility::blocked_sql(flow_ref, messages.then_some("t.id"));
+    let favorite = format!("EXISTS(SELECT 1 FROM traffic_favorites WHERE flow_id={flow_ref})");
+    let flagged = format!(
+        "(EXISTS(SELECT 1 FROM flag_events fe WHERE fe.flow_id={flow_ref}) OR EXISTS(SELECT 1 FROM traffic_favorites WHERE flow_id={flow_ref} AND has_flag=1))"
+    );
+    let mut sql = String::new();
+    let mut values = Vec::new();
+    if let Some(favorite_filter) = q.favorite {
+        sql.push_str(&format!(
+            " AND {}({favorite})",
+            if favorite_filter { "" } else { "NOT " }
+        ));
+    }
+    if q.include_blocked == Some(false) {
+        sql.push_str(&format!(" AND NOT ({blocked})"));
+    }
+    if let Some(v) = &q.service_id {
+        sql.push_str(" AND t.service_id=?");
+        values.push(Sql::Text(v.clone()));
+    }
+    if let Some(v) = q.since_ms {
+        sql.push_str(" AND t.occurred_ms>=?");
+        values.push(Sql::Integer(v));
+    }
+    if let Some(v) = q.until_ms {
+        sql.push_str(" AND t.occurred_ms<=?");
+        values.push(Sql::Integer(v));
+    }
+    // Endpoint predicates refer to the indexed opening flow, not a guessed message direction.
+    if let Some(v) = q.client_ip.clone().or_else(|| q.source_ip.clone()) {
+        sql.push_str(&if messages {
+            format!(
+                " AND EXISTS(SELECT 1 FROM traffic_flows f WHERE f.id={flow_ref} AND f.client_ip=?)"
+            )
+        } else {
+            " AND t.client_ip=?".into()
+        });
+        values.push(Sql::Text(v));
+    }
+    if let Some(v) = &q.destination_ip {
+        sql.push_str(&if messages {
+            format!(" AND EXISTS(SELECT 1 FROM traffic_flows f WHERE f.id={flow_ref} AND json_extract(f.data,'$.upstream.ip')=?)")
+        } else {
+            " AND json_extract(t.data,'$.upstream.ip')=?".into()
+        });
+        values.push(Sql::Text(v.clone()));
+    }
+    if let Some(v) = q.transport {
+        sql.push_str(&if messages {
+            format!(" AND EXISTS(SELECT 1 FROM traffic_flows f WHERE f.id={flow_ref} AND json_extract(f.data,'$.transport')=?)")
+        } else {
+            " AND json_extract(t.data,'$.transport')=?".into()
+        });
+        values.push(Sql::Integer(v.into()));
+    }
+    if let Some(v) = &q.matched_rule {
+        sql.push_str(&format!(
+            " AND EXISTS(SELECT 1 FROM traffic_events e WHERE e.flow_id={flow_ref} AND e.kind='rule_hit' AND json_extract(e.data,'$.rule_id')=?)"
+        ));
+        values.push(Sql::Text(v.clone()));
+    }
+    if let Some(v) = q.has_flag {
+        sql.push_str(&format!(" AND {}({flagged})", if v { "" } else { "NOT " }));
+    }
+    if q.direction.is_some() || q.field_path.is_some() {
+        let predicate = if messages {
+            "m.id=t.id".to_owned()
+        } else {
+            "m.flow_id=t.id".to_owned()
+        };
+        sql.push_str(&format!(
+            " AND EXISTS(SELECT 1 FROM traffic_messages m WHERE {predicate}"
+        ));
+        if let Some(v) = q.direction {
+            sql.push_str(" AND json_extract(m.data,'$.direction')=?");
+            values.push(Sql::Integer(v.into()));
+        }
+        if let Some(v) = &q.field_path {
+            sql.push_str(
+                " AND EXISTS(SELECT 1 FROM json_each(m.data,'$.fields') field WHERE field.key=?",
+            );
+            values.push(Sql::Text(v.clone()));
+            if let Some(v) = &q.field_value {
+                sql.push_str(" AND CAST(json_extract(field.value,'$.value') AS TEXT)=?");
+                values.push(Sql::Text(v.clone()));
+            }
+            sql.push(')');
+        }
+        sql.push(')');
+    }
+    (sql, values)
+}
+
 struct Row {
     event_id: String,
     flow_id: String,

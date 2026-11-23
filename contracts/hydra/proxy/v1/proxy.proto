@@ -37,6 +37,9 @@ service ProxyDiagnostics {
   rpc CaptureSample(CaptureSampleRequest) returns (CaptureSampleReply);
   rpc GetSample(GetSampleRequest) returns (GetSampleReply);
   rpc GetFlowHistory(GetFlowHistoryRequest) returns (GetFlowHistoryReply);
+  // On-demand tail of an active flow from the bounded in-memory buffer.
+  // Additive: completed flows keep using GetFlowHistory.
+  rpc GetActiveFlowHistory(GetActiveFlowHistoryRequest) returns (GetActiveFlowHistoryReply);
   rpc SetFlowFavorite(SetFlowFavoriteRequest) returns (SetFlowFavoriteReply);
   // Replays retained flows locally and returns only filter outcome metadata.
   rpc PreviewFilter(PreviewFilterRequest) returns (PreviewFilterReply);
@@ -375,6 +378,37 @@ message GetFlowHistoryReply {
   // Observed datagrams, including blocked traffic; byte totals above are forwarded bytes.
   uint64 datagrams_client_to_server = 13;
   uint64 datagrams_server_to_client = 14;
+}
+// Additive active-flow contract. Field numbers are frozen by the Streams design.
+message GetActiveFlowHistoryRequest {
+  string flow_id = 1;
+  Actor actor = 2;          // audit provenance, never from user input
+  string request_id = 3;    // Core request id, for correlation
+  ActiveBytesCursor cursor = 4; // optional; omit for a full tail snapshot
+}
+message ActiveBytesCursor {
+  uint64 client_sequence = 1;
+  uint64 server_sequence = 2;
+  uint64 client_head_dropped = 3;
+  uint64 server_head_dropped = 4;
+}
+message GetActiveFlowHistoryReply {
+  string flow_id = 1;
+  string service_id = 2;
+  string protocol_id = 3;
+  int64 opened_at_ms = 4;
+  bool active = 5;
+  repeated HistorySegment segments = 6;   // same message as GetFlowHistoryReply.segments
+  bool truncated_client_to_server = 7;
+  bool truncated_server_to_client = 8;
+  uint64 retained_client_to_server_bytes = 9;
+  uint64 retained_server_to_client_bytes = 10;
+  bool reset = 11;                        // true => replace, do not append
+  uint64 client_sequence = 12;
+  uint64 server_sequence = 13;
+  uint64 client_head_dropped = 14;
+  uint64 server_head_dropped = 15;
+  int64 generated_at_ms = 16;
 }
 message FilterPreviewTarget {
   string flow_id = 1;

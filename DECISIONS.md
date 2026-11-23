@@ -408,3 +408,90 @@ negotiated, so the prompt states that only connections opened after saving are
 read as HTTP; captured history stays opaque and is not rewritten. Detection is
 client-side on bytes the console already receives, so no new API field, protobuf
 message or migration is added.
+
+## 036 — Normal telemetry batches only already-ready events (2026-11-23)
+
+Under sustained UTF-8 traffic the Proxy forwarded one `EventBatch` per event, so
+Core indexing and the telemetry stream paid per-event framing even though
+`StreamTelemetryRequest.max_events_per_batch` already existed. The stream now
+awaits exactly one broadcast event as before, then drains only events already
+queued with `try_recv`, never with a timer or delay. Batching therefore adds no
+latency at low rates, and the data path, broadcast ring and `mpsc(16)` queue are
+unchanged; only the payload of each already-queued message grows.
+
+Bounds are `max_events_per_batch` (validated `> 128` before subscribing) and
+256 KiB of encoded batch bytes, measured with prost `encoded_len`. `0` keeps the
+legacy one-event-per-batch behaviour rather than meaning "server default", so a
+client that omits the field sees no behaviour change. A candidate that would
+cross the byte cap is carried into the next batch as its first event, preserving
+FIFO order without splitting or dropping it; a single event larger than the cap
+is still sent alone. `Lagged(n)` increments the dropped counter exactly once at
+the point the gap is observed and contributes one `subscriber_lag` loss marker,
+including while draining or when that marker has to be carried. A closed
+broadcast still flushes the batch already assembled.
+
+One event whose protobuf encoding exceeds Core's 49,152-byte field budget is
+forced to travel alone. That constant mirrors Core's *field budget* only
+(`traffic::repository::field`); it is not Core's 64 KiB JSON-row limit. Core
+converts a whole batch before its transaction and rejects the entire batch on
+one error, so a single event over the field budget would otherwise discard up to
+127 healthy neighbours: for that class, keeping the existing one-event blast
+radius is the compatibility requirement, not a new Core limit. Core's separate
+`data.len() > 65536` JSON-row rejection is **not** bounded by `encoded_len`
+(bytes fields become JSON number arrays, control characters escape to `\u00XX`,
+and many small bytes fields can compound), so an event under the guard can still
+fail the whole mixed batch. That residual per-event isolation gap is documented
+here and needs a separate follow-up (Core per-event skip/reject accounting or a
+tested proxy guard); this change does not claim batch poisoning is eliminated
+for all cases. If Core's acceptance policy changes, this constant must follow.
+
+Queue memory is bounded in *encoded* bytes, not heap bytes: the retained
+`mpsc(16)` holds up to 256 KiB per multi-event batch (≈4 MiB per subscriber,
+≈16 MiB across the four permits) plus one carried event, and an oversized solo
+event adds its own size as an exception. Those are upper bounds on encoded
+payload, not measured RSS; prost container overhead can be a multiple of them.
+
+The batching loop lives in `grpc/telemetry.rs` because the pre-existing
+`ProxyTelemetry` handler already built and sent one `EventBatch` there; this
+change extends that delivery loop in place rather than moving ownership to
+`telemetry/`. No new crate, process or Core dependency is introduced, and a
+future extraction into `telemetry/` is optional, not required by this fix.
+`first_sequence`, `critical`, the epoch format, the critical spool and
+proto/OpenAPI are untouched.
+
+## 037 — Page-scoped WebSocket for the Streams workspace (2026-11-23)
+
+User amendment (explicit, 2026-11-23): live Streams-page updates, initial snapshot, messages, global
+retained search and byte history (active and closed) travel over one authenticated page-scoped
+WebSocket; flag highlight spans are computed for selected messages and search results. This amends
+SPEC line 84 ("frontend live traffic via SSE") for `TrafficPage` only. Design:
+`docs/superpowers/specs/2026-11-23-streams-workspace-design.md`.
+
+- SSE endpoint `/api/v1/traffic/events/stream` is unchanged and remains the transport for
+  `ConsoleLayout`, `FilterStreamWorkspace` and external consumers; no OpenAPI change (a WS upgrade is
+  not expressible in OpenAPI 3.1 and is not annotated).
+- One socket per page, in-band `auth` frame; token never in URL, query string or logs. Access JWT
+  remains 60 s: client re-auth ≤50 s, server re-verify every 5 s, close 4401 on expiry/revocation.
+- Caps unchanged in count: 2 sockets/actor, 128 actors, 16 total shared with SSE, one search and one
+  history stream per socket. Inbound frames are capped at 32 KiB; outbound frames may exceed it with
+  bytes and are bounded by 1 MiB per frame / 4 MiB queued per socket.
+- Byte history is an **on-demand** Proxy diagnostic read: `GetActiveFlowHistory` (additive proto,
+  fields 1–16 frozen, reusing the existing `HistorySegment` message) for the active 64 KiB/direction
+  tail, and the existing `GetFlowHistory` for closed flows. Both arrive as `active_bytes` frames with
+  `snapshot.active` reflecting the source. No continuous raw packet broadcast, no data-plane Core
+  dependency, no raw history files searched, no HTTP fallback on the Streams page. Legacy HTTP
+  `GET .../history` keeps its 409 for active flows for non-Streams consumers.
+- The new RPC validates actor (from the verified JWT, never a WS frame) and request id, writes one
+  audit row, and never broadcasts; a head drop forces a snapshot `reset`, never a splice.
+- Global search is a resumable bounded Rust-side scan over decoded zstd backing rows: no FTS, no
+  migration, no backfill, no 4 KiB projection. Literal case-insensitive input (not user regex), full
+  retained decoded text, per request ≤5 000 rows / 750 ms / 32 MiB, cursor = last scanned position
+  (globally stable `seq`). Responses carry `coverage {scanned,truncated,continuation,undecodable,
+  decoded_only,raw_history_searched:false}`; the client auto-continues up to 3 units then shows an
+  explicit partial/More state. Proxy raw capture and rotated-out bytes are not searched.
+- Flag highlight spans are server-computed from the visible configured Core `flag_pattern`, returned
+  as **UTF-16 code units**, and rendered as text nodes (no `v-html`, no `new RegExp` on untrusted
+  text). `has_flag` remains the canonical flow-level finding predicate; highlighting never changes
+  finding truth.
+- No new process, crate, or data-plane path; `axum` gains the `ws` feature and `tokio-tungstenite` is a
+  dev-dependency only.

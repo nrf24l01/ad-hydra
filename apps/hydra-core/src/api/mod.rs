@@ -275,6 +275,8 @@ pub fn router(view: SharedView, modules: Modules) -> Router {
         ))
 }
 #[cfg(test)]
+mod history_audit_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

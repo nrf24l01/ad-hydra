@@ -83,6 +83,9 @@ pub struct Settings {
     pub file: Arc<Mutex<file::ConfigFile>>,
     history_policy: Option<tokio::sync::watch::Sender<(u64, i32)>>,
     proxy_view: Option<crate::api::SharedView>,
+    /// Live traffic state that caches the highlight pattern; refreshed on save
+    /// so a `flag_pattern` change applies without a Core restart.
+    traffic: Option<crate::modules::traffic::Traffic>,
 }
 #[utoipa::path(get,path="/api/v1/system/settings",responses((status=200,body=SettingsView),(status=401)),tag="system")]
 async fn settings(
@@ -151,6 +154,7 @@ impl Settings {
             file: Arc::new(Mutex::new(file::ConfigFile::new(path)?)),
             history_policy: None,
             proxy_view: None,
+            traffic: None,
         })
     }
     pub fn with_history_policy(
@@ -160,6 +164,11 @@ impl Settings {
     ) -> Self {
         self.history_policy = Some(policy);
         self.proxy_view = Some(view);
+        self
+    }
+    /// Attach the traffic runtime so saved highlight patterns take effect live.
+    pub fn with_traffic(mut self, traffic: crate::modules::traffic::Traffic) -> Self {
+        self.traffic = Some(traffic);
         self
     }
     async fn current_view(&self) -> Result<SettingsView, StatusCode> {
@@ -301,6 +310,7 @@ async fn update_settings(
                 u64::from(saved.settings.traffic_history_per_service_mib)
                     * hydra_domain::history::MIB,
                 saved.settings.traffic_history_compression_level,
+                saved.settings.flag_pattern,
             )),
             Ok(Err(file::SaveError::Conflict)) => Err(error(
                 StatusCode::CONFLICT,
@@ -324,9 +334,14 @@ async fn update_settings(
         outcome,
     )
     .await?;
-    let (history_bytes, compression_level) = result?;
+    let (history_bytes, compression_level, flag_pattern) = result?;
     hydra_compression::set_level(compression_level)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "Invalid zstd compression level"))?;
+    // Highlight pattern is owned by settings; recompile it for live Streams
+    // frames instead of keeping the startup value until restart.
+    if let Some(traffic) = &state.traffic {
+        traffic.refresh_flag_pattern(flag_pattern.as_deref());
+    }
     if let Some(policy) = &state.history_policy {
         policy.send_replace((history_bytes, compression_level));
     }

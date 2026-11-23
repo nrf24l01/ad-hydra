@@ -95,6 +95,10 @@ struct Buffer {
     opened_at_ms: i64,
     truncated_client: bool,
     truncated_server: bool,
+    // Bytes removed from the head of each direction, by direction index.
+    // Cursors carry these counters so a reader can distinguish an append-only
+    // tail from one whose beginning was evicted.
+    dropped: [u64; 2],
     discarded: bool,
     udp: bool,
     datagrams: VecDeque<Datagram>,
@@ -162,12 +166,79 @@ impl std::error::Error for HistoryReadError {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+/// Client cursor for [`HistoryStore::active_snapshot`].
+///
+/// The sequence fields are the last chunk sequence observed in each direction,
+/// not a global offset. `*_head_dropped` are the matching retained-head byte
+/// counters. A cursor that no longer describes the retained head forces a full
+/// snapshot (`reset = true`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ActiveCursor {
+    pub(crate) client_sequence: u64,
+    pub(crate) server_sequence: u64,
+    pub(crate) client_head_dropped: u64,
+    pub(crate) server_head_dropped: u64,
+}
+
+/// Bounded, in-memory snapshot of an active flow. Segments reuse [`Datagram`]
+/// because its direction/sequence/occurred_at/data shape is identical to the
+/// generated `HistorySegment` wire message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveSnapshot {
+    pub(crate) flow_id: String,
+    pub(crate) service_id: String,
+    pub(crate) protocol_id: String,
+    pub(crate) opened_at_ms: i64,
+    // True for whole-datagram UDP records; the gRPC handler maps this to
+    // `HistorySegment.datagram`.
+    pub(crate) udp: bool,
+    pub(crate) segments: Vec<Datagram>,
+    pub(crate) truncated_client_to_server: bool,
+    pub(crate) truncated_server_to_client: bool,
+    pub(crate) retained_client_to_server_bytes: u64,
+    pub(crate) retained_server_to_client_bytes: u64,
+    pub(crate) reset: bool,
+    pub(crate) client_sequence: u64,
+    pub(crate) server_sequence: u64,
+    pub(crate) client_head_dropped: u64,
+    pub(crate) server_head_dropped: u64,
+    pub(crate) generated_at_ms: i64,
+}
+
+fn last_sequences(datagrams: &VecDeque<Datagram>) -> (u64, u64) {
+    let mut last = (0, 0);
+    for chunk in datagrams {
+        if chunk.direction == 1 {
+            last.0 = chunk.sequence;
+        } else {
+            last.1 = chunk.sequence;
+        }
+    }
+    last
+}
+
+fn retained_bytes(datagrams: &VecDeque<Datagram>) -> (u64, u64) {
+    let mut bytes = [0u64; 2];
+    for chunk in datagrams {
+        let index = usize::from(chunk.direction == 2);
+        bytes[index] = bytes[index].saturating_add(chunk.data.len() as u64);
+    }
+    (bytes[0], bytes[1])
+}
+
+fn cursor_sequence_retained(datagrams: &VecDeque<Datagram>, direction: u8, sequence: u64) -> bool {
+    sequence == 0
+        || datagrams
+            .iter()
+            .any(|chunk| chunk.direction == direction && chunk.sequence == sequence)
 }
 
 impl HistoryStore {
@@ -522,6 +593,83 @@ impl HistoryStore {
         .map_err(|error| HistoryReadError::Storage(error.into()))?
         .map_err(HistoryReadError::Storage)
     }
+
+    /// Copy the bounded in-memory tail of an active flow.
+    ///
+    /// This never touches disk and never waits for the persistence worker. A
+    /// closed or unknown flow yields `Ok(None)`. A cursor that still describes
+    /// the retained head yields only newer chunks; an unchanged cursor yields
+    /// an empty delta. Eviction or an inconsistent cursor forces `reset = true`
+    /// and returns the whole retained tail.
+    pub(crate) fn active_snapshot(
+        &self,
+        flow_id: &str,
+        cursor: Option<ActiveCursor>,
+    ) -> Result<Option<ActiveSnapshot>, HistoryReadError> {
+        if flow_id.is_empty() || flow_id.len() > 128 || uuid::Uuid::parse_str(flow_id).is_err() {
+            return Ok(None);
+        }
+        let Some(buffer) = self
+            .0
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(flow_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        if buffer.discarded {
+            return Ok(None);
+        }
+        let (client_sequence, server_sequence) = last_sequences(&buffer.datagrams);
+        let (retained_client, retained_server) = retained_bytes(&buffer.datagrams);
+        let reset = match cursor {
+            None => true,
+            Some(cursor) => {
+                cursor.client_head_dropped != buffer.dropped[0]
+                    || cursor.server_head_dropped != buffer.dropped[1]
+                    || cursor.client_sequence > client_sequence
+                    || cursor.server_sequence > server_sequence
+                    || !cursor_sequence_retained(&buffer.datagrams, 1, cursor.client_sequence)
+                    || !cursor_sequence_retained(&buffer.datagrams, 2, cursor.server_sequence)
+            }
+        };
+        let segments = match cursor {
+            Some(cursor) if !reset => buffer
+                .datagrams
+                .iter()
+                .filter(|chunk| {
+                    if chunk.direction == 1 {
+                        chunk.sequence > cursor.client_sequence
+                    } else {
+                        chunk.sequence > cursor.server_sequence
+                    }
+                })
+                .cloned()
+                .collect(),
+            _ => buffer.datagrams.iter().cloned().collect(),
+        };
+        Ok(Some(ActiveSnapshot {
+            flow_id: flow_id.to_owned(),
+            service_id: buffer.service_id.clone(),
+            protocol_id: buffer.protocol_id.clone(),
+            opened_at_ms: buffer.opened_at_ms,
+            udp: buffer.udp,
+            segments,
+            truncated_client_to_server: buffer.truncated_client,
+            truncated_server_to_client: buffer.truncated_server,
+            retained_client_to_server_bytes: retained_client,
+            retained_server_to_client_bytes: retained_server,
+            reset,
+            client_sequence,
+            server_sequence,
+            client_head_dropped: buffer.dropped[0],
+            server_head_dropped: buffer.dropped[1],
+            generated_at_ms: now_ms(),
+        }))
+    }
 }
 
 impl HistoryWriter {
@@ -544,6 +692,8 @@ impl HistoryWriter {
                 };
                 let old_index = usize::from(old.direction == 2);
                 buffer.datagram_bytes[old_index] -= old.data.len();
+                buffer.dropped[old_index] =
+                    buffer.dropped[old_index].saturating_add(old.data.len() as u64);
                 if old_index == 0 {
                     buffer.truncated_client = true;
                 } else {
@@ -551,6 +701,7 @@ impl HistoryWriter {
                 }
             }
             if bytes.len() > MAX_DIRECTION_BYTES {
+                buffer.dropped[index] = buffer.dropped[index].saturating_add(bytes.len() as u64);
                 if index == 0 {
                     buffer.truncated_client = true;
                 } else {
@@ -1148,3 +1299,6 @@ mod terminal_history_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+mod active_tests;

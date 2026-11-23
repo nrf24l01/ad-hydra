@@ -1,4 +1,5 @@
 import type { FlowHistory, HistorySegment, Page } from '@/generated/contracts'
+import { readFlagSpans, type FlagSpan } from './highlight'
 export function record(value: unknown): Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 export function text(value: unknown) { return typeof value === 'string' || typeof value === 'number' ? String(value) : '' }
 export function direction(value: unknown) { return value === 1 ? 'Client → server' : value === 2 ? 'Server → client' : 'Unknown direction' }
@@ -43,8 +44,13 @@ export function mergeFlows(current: Flow[], incoming: Flow[], older = false): Fl
  }
  return [...unique.values()].slice(0,500)
 }
-export function messageRows(page: Page) { return page.items.map(item => ({ ...item, blocked:item.blocked===true, message_id:text(item.message_id), stream_sequence:item.stream_sequence, occurred_ms:item.occurred_ms, direction:item.direction, message_type:text(item.message_type), protocol_id:text(item.protocol_id), fields:record(item.fields), truncated:item.truncated===true })) }
+export function messageRows(page: Page) { return page.items.map(item => ({ ...item, blocked:item.blocked===true, message_id:text(item.message_id), stream_sequence:item.stream_sequence, occurred_ms:item.occurred_ms, direction:item.direction, message_type:text(item.message_type), protocol_id:text(item.protocol_id), fields:record(item.fields), truncated:item.truncated===true, display_text:typeof item.display_text==='string'?item.display_text:undefined, flag_spans:readFlagSpans(item.flag_spans) })) }
 export type Message = ReturnType<typeof messageRows>[number]
+/** Server display annotation only; never used as finding truth. */
+export function messageDisplayText(message: Pick<Message,'display_text'|'fields'>): string {
+ return typeof message.display_text==='string'?message.display_text:streamText(message)
+}
+export type { FlagSpan }
 /** Saved native transfer summaries describe read sizes, independent of the service's current profile. */
 export function onlyRawSummaryMessages(messages: Message[]): boolean {
  return messages.length>0&&messages.every(message=>message.protocol_id==='transfer'&&message.message_type==='byte_summary')

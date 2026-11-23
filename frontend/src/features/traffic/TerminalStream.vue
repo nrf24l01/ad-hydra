@@ -7,11 +7,10 @@ import {Button} from '@/components/ui/button'
 import type {TerminalChunk} from './terminal'
 import {TranscriptWriter} from './terminalWriter'
 import {useTheme} from '@/app/theme'
+import {compileFlagPattern} from './flagPattern'
 const props=defineProps<{chunks:TerminalChunk[];truncated?:boolean;flagPattern?:string}>()
-const flagRegex=computed<RegExp|null>(()=>{
- const source=props.flagPattern?.trim();if(!source)return null
- try{return new RegExp(source,'g')}catch{return null}
-})
+const flag=computed(()=>compileFlagPattern(props.flagPattern))
+const flagRegex=computed(()=>flag.value.regex)
 const {theme}=useTheme()
 const host=ref<HTMLElement>(),status=ref(''),following=ref(true)
 let terminal:Terminal|undefined,fit:FitAddon|undefined,observer:ResizeObserver|undefined,frame:number|undefined,disposed=false
@@ -33,7 +32,8 @@ onUnmounted(()=>{disposed=true;observer?.disconnect();if(frame!==undefined)cance
 </script>
 <template>
  <section class="flex min-h-0 flex-1 flex-col gap-2" aria-label="Read-only captured terminal">
-  <div class="flex shrink-0 items-center justify-between gap-2 text-xs text-muted-foreground"><span>Client: red · Server: blue · Invalid UTF-8: yellow hex · Flags highlighted · read-only</span><Button v-if="!following" size="sm" variant="outline" @click="follow">Follow output</Button></div>
+  <div class="flex shrink-0 items-center justify-between gap-2 text-xs text-muted-foreground"><span>Client: red · Server: blue · Invalid UTF-8: yellow hex · {{flag.regex?'Flags highlighted':'Flag highlighting unavailable'}} · read-only</span><Button v-if="!following" size="sm" variant="outline" @click="follow">Follow output</Button></div>
+  <p v-if="flag.status.includes('unsupported')" role="status" class="text-xs text-amber-500">{{flag.status}}</p>
   <p v-if="truncated" role="status" class="text-xs text-muted-foreground">The terminal preview is bounded; older text has been omitted.</p>
   <div ref="host" id="traffic-terminal" class="min-h-[240px] min-w-0 flex-1 overflow-hidden rounded-md border bg-background p-2" aria-label="Terminal stream"/>
   <span class="sr-only" role="status">{{status}}</span>

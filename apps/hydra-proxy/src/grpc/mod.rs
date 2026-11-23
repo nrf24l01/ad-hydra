@@ -1,6 +1,8 @@
 mod control;
 mod diagnostics;
 mod telemetry;
+#[cfg(test)]
+mod telemetry_batching_tests;
 use crate::state::State;
 use std::sync::Arc;
 #[derive(Clone)]

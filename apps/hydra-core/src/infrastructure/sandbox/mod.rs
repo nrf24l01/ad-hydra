@@ -3,6 +3,8 @@ mod bridge;
 mod cgroup;
 mod command;
 mod python;
+#[cfg(test)]
+mod runtime_path_tests;
 pub use python::validate_python_packages;
 
 pub use bridge::{BridgeConfig, Endpoint, bridge};
@@ -321,7 +323,15 @@ mod tests {
     }
     #[tokio::test]
     async fn unavailable_cgroup_never_starts_upload() {
-        let root = std::env::temp_dir().join(format!("hs-{}", uuid::Uuid::new_v4().simple()));
+        // Unix socket paths also spend bytes on TMPDIR, so the product budget is 62 bytes
+        // for the sandbox root. A short fixture name keeps this valid on scratch TMPDIRs:
+        // 16 hex chars carry the lower 64 UUID bits (62 random after the v4 variant bits).
+        let root =
+            std::env::temp_dir().join(format!("hs-{:016x}", uuid::Uuid::new_v4().as_u64_pair().1));
+        assert!(
+            root.as_os_str().len() <= 62,
+            "fixture root exceeds the 62-byte Unix socket budget: {root:?}"
+        );
         std::fs::create_dir(&root).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -373,8 +383,13 @@ mod tests {
             .expect("set HYDRA_SANDBOX_TARGET to a non-loopback TCP echo endpoint")
             .parse()
             .unwrap();
+        // Same 62-byte Unix socket budget as the upload fixture: keep the operator root short.
         let root =
-            std::env::temp_dir().join(format!("hydra-sandbox-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("hs-{:016x}", uuid::Uuid::new_v4().as_u64_pair().1));
+        assert!(
+            root.as_os_str().len() <= 62,
+            "fixture root exceeds the 62-byte Unix socket budget: {root:?}"
+        );
         std::fs::create_dir(&root).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;

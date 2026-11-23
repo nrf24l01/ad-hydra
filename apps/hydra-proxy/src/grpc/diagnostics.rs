@@ -688,6 +688,79 @@ impl ProxyDiagnostics for Rpc {
             history_truncated: history.history_truncated,
         }))
     }
+    async fn get_active_flow_history(
+        &self,
+        request: Request<v1::GetActiveFlowHistoryRequest>,
+    ) -> Result<Response<v1::GetActiveFlowHistoryReply>, Status> {
+        let input = request.into_inner();
+        check_provenance(input.actor.as_ref(), &input.request_id)?;
+        if input.flow_id.is_empty()
+            || input.flow_id.len() > 128
+            || uuid::Uuid::parse_str(&input.flow_id).is_err()
+        {
+            return Err(Status::invalid_argument("invalid flow identifier"));
+        }
+        let store = self
+            .state
+            .telemetry
+            .history
+            .read()
+            .map_err(|_| Status::internal("history store unavailable"))?
+            .clone()
+            .ok_or_else(|| Status::unavailable("history store disabled"))?;
+        let cursor = input.cursor.map(|cursor| crate::history::ActiveCursor {
+            client_sequence: cursor.client_sequence,
+            server_sequence: cursor.server_sequence,
+            client_head_dropped: cursor.client_head_dropped,
+            server_head_dropped: cursor.server_head_dropped,
+        });
+        let snapshot = store
+            .active_snapshot(&input.flow_id, cursor)
+            .map_err(history_status)?;
+        let generated_at_ms = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.generated_at_ms)
+            .unwrap_or_else(crate::history::now_ms);
+        let Some(snapshot) = snapshot else {
+            // Closed/unknown flows are not an error: Core falls back to the
+            // persisted GetFlowHistory path.
+            return Ok(Response::new(v1::GetActiveFlowHistoryReply {
+                flow_id: input.flow_id,
+                active: false,
+                generated_at_ms,
+                ..Default::default()
+            }));
+        };
+        let datagram = snapshot.udp;
+        Ok(Response::new(v1::GetActiveFlowHistoryReply {
+            flow_id: snapshot.flow_id,
+            service_id: snapshot.service_id,
+            protocol_id: snapshot.protocol_id,
+            opened_at_ms: snapshot.opened_at_ms,
+            active: true,
+            segments: snapshot
+                .segments
+                .into_iter()
+                .map(|segment| v1::HistorySegment {
+                    direction: segment.direction.into(),
+                    data: segment.data,
+                    datagram,
+                    occurred_at_ms: segment.occurred_at_ms,
+                    sequence: segment.sequence,
+                })
+                .collect(),
+            truncated_client_to_server: snapshot.truncated_client_to_server,
+            truncated_server_to_client: snapshot.truncated_server_to_client,
+            retained_client_to_server_bytes: snapshot.retained_client_to_server_bytes,
+            retained_server_to_client_bytes: snapshot.retained_server_to_client_bytes,
+            reset: snapshot.reset,
+            client_sequence: snapshot.client_sequence,
+            server_sequence: snapshot.server_sequence,
+            client_head_dropped: snapshot.client_head_dropped,
+            server_head_dropped: snapshot.server_head_dropped,
+            generated_at_ms: snapshot.generated_at_ms,
+        }))
+    }
     async fn probe_service(
         &self,
         request: Request<v1::ProbeServiceRequest>,

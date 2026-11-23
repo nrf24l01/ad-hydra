@@ -4,7 +4,11 @@ export type TrafficEvent = Record<string, unknown> & { kind: string; flow_id: st
 export function trafficEvent(frame: string): TrafficEvent | undefined {
  const parsed=parseEventFrame(frame)
  if(parsed?.event!=='traffic')return
- const event=record(JSON.parse(parsed.data))
+ return liveEvent(JSON.parse(parsed.data))
+}
+/** Typed view of one WebSocket `flow`/`message` event (same shape as SSE traffic data). */
+export function liveEvent(value: unknown): TrafficEvent | undefined {
+ const event=record(value)
  if(typeof event.kind!=='string'||typeof event.flow_id!=='string'||typeof event.service_id!=='string')throw new Error('Invalid live traffic event')
  return event as TrafficEvent
 }

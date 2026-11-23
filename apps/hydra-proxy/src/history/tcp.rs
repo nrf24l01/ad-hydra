@@ -11,6 +11,8 @@ impl Buffer {
         let sequence = self.datagram_totals[0].saturating_add(self.datagram_totals[1]);
         if bytes.len() > MAX_DIRECTION_BYTES {
             self.mark_truncated(index);
+            self.dropped[index] =
+                self.dropped[index].saturating_add((bytes.len() - MAX_DIRECTION_BYTES) as u64);
         }
         let bytes = &bytes[bytes.len().saturating_sub(MAX_DIRECTION_BYTES)..];
         let mut overflow = self.datagram_bytes[index]
@@ -33,12 +35,14 @@ impl Buffer {
             }
             self.datagram_bytes[index] -= remove;
             overflow -= remove;
+            self.dropped[index] = self.dropped[index].saturating_add(remove as u64);
             self.mark_truncated(index);
         }
         while self.datagrams.len() >= MAX_DATAGRAMS {
             if let Some(old) = self.datagrams.pop_front() {
                 let side = usize::from(old.direction == 2);
                 self.datagram_bytes[side] -= old.data.len();
+                self.dropped[side] = self.dropped[side].saturating_add(old.data.len() as u64);
                 self.mark_truncated(side);
             }
         }

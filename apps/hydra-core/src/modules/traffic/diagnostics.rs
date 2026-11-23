@@ -225,7 +225,8 @@ async fn flow_history(
         return Err(StatusCode::NOT_FOUND);
     }
     let actor = actor(&state, &headers, false).await?;
-    let request = uuid::Uuid::new_v4().to_string();
+    // Correlate with the scoped HTTP request id so a future 409 is traceable.
+    let request = crate::modules::audit::request_id();
     record(
         &state,
         actor.clone(),
@@ -248,12 +249,24 @@ async fn flow_history(
         &state,
         actor,
         "traffic.history.result",
-        id,
-        request,
+        id.clone(),
+        request.clone(),
         result.is_ok(),
     )
     .await?;
-    let history = result.map_err(map_history_status)?;
+    let history = match result {
+        Ok(history) => history,
+        Err(error) => {
+            let status = map_history_status(error);
+            tracing::warn!(
+                request_id = %request,
+                flow_id = %id,
+                status = status.as_u16(),
+                "flow history read failed"
+            );
+            return Err(status);
+        }
+    };
     Ok(Json(FlowHistory {
         transport: history.transport,
         datagrams_client_to_server: history.datagrams_client_to_server,
@@ -289,6 +302,170 @@ fn map_history_status(error: tonic::Status) -> StatusCode {
         tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
         tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// Cursor for the additive active-flow snapshot; sequences are per-direction
+/// chunk counters plus retained-head byte counters, never global offsets.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ActiveCursor {
+    pub client_sequence: u64,
+    pub server_sequence: u64,
+    pub client_head_dropped: u64,
+    pub server_head_dropped: u64,
+}
+
+/// One history snapshot delivered over WS, from either Proxy source.
+#[derive(serde::Serialize)]
+pub(crate) struct ActiveHistory {
+    pub flow_id: String,
+    pub service_id: String,
+    pub protocol_id: String,
+    pub opened_at_ms: i64,
+    pub active: bool,
+    /// Closed flow whose history is still being persisted; retry is bounded.
+    pub pending: bool,
+    pub segments: Vec<HistorySegment>,
+    pub truncated_client_to_server: bool,
+    pub truncated_server_to_client: bool,
+    pub retained_client_to_server_bytes: u64,
+    pub retained_server_to_client_bytes: u64,
+    pub reset: bool,
+    pub client_sequence: u64,
+    pub server_sequence: u64,
+    pub client_head_dropped: u64,
+    pub server_head_dropped: u64,
+    pub generated_at_ms: i64,
+}
+
+pub(crate) enum HistoryFailure {
+    /// Flow closed but its history is still being written (legacy 409 state).
+    Pending,
+    NotFound,
+    Unavailable(&'static str),
+}
+
+fn convert_segment(segment: v1::HistorySegment) -> HistorySegment {
+    HistorySegment {
+        direction: segment.direction,
+        data: segment.data,
+        datagram: segment.datagram,
+        occurred_at_ms: segment.occurred_at_ms,
+        sequence: segment.sequence,
+    }
+}
+
+/// On-demand history for the selected stream: active snapshot while live,
+/// otherwise the persisted `GetFlowHistory` result in the same shape.
+pub(crate) async fn read_active(
+    socket: &std::path::Path,
+    flow_id: String,
+    actor: audit::Actor,
+    request_id: String,
+    cursor: Option<ActiveCursor>,
+) -> Result<ActiveHistory, HistoryFailure> {
+    let channel = proxy_client::connect(socket)
+        .await
+        .map_err(|_| HistoryFailure::Unavailable("proxy_unavailable"))?;
+    let mut client = ProxyDiagnosticsClient::new(channel);
+    let reply = client
+        .get_active_flow_history(v1::GetActiveFlowHistoryRequest {
+            flow_id: flow_id.clone(),
+            actor: Some(v1::Actor {
+                r#type: 1,
+                user_id: actor.id.clone(),
+                ..Default::default()
+            }),
+            request_id: request_id.clone(),
+            cursor: cursor.map(|cursor| v1::ActiveBytesCursor {
+                client_sequence: cursor.client_sequence,
+                server_sequence: cursor.server_sequence,
+                client_head_dropped: cursor.client_head_dropped,
+                server_head_dropped: cursor.server_head_dropped,
+            }),
+        })
+        .await;
+    let reply = match reply {
+        Ok(reply) => reply.into_inner(),
+        Err(status) => {
+            let code = if status.code() == tonic::Code::Unimplemented {
+                "active_bytes_unavailable"
+            } else {
+                "history_unavailable"
+            };
+            tracing::warn!(
+                request_id = %request_id,
+                flow_id = %flow_id,
+                grpc_code = status.code() as i32,
+                "active history read failed"
+            );
+            return Err(HistoryFailure::Unavailable(code));
+        }
+    };
+    if reply.active {
+        return Ok(ActiveHistory {
+            flow_id: reply.flow_id,
+            service_id: reply.service_id,
+            protocol_id: reply.protocol_id,
+            opened_at_ms: reply.opened_at_ms,
+            active: true,
+            pending: false,
+            segments: reply.segments.into_iter().map(convert_segment).collect(),
+            truncated_client_to_server: reply.truncated_client_to_server,
+            truncated_server_to_client: reply.truncated_server_to_client,
+            retained_client_to_server_bytes: reply.retained_client_to_server_bytes,
+            retained_server_to_client_bytes: reply.retained_server_to_client_bytes,
+            reset: reply.reset,
+            client_sequence: reply.client_sequence,
+            server_sequence: reply.server_sequence,
+            client_head_dropped: reply.client_head_dropped,
+            server_head_dropped: reply.server_head_dropped,
+            generated_at_ms: reply.generated_at_ms,
+        });
+    }
+    // Closed/unknown to the active map: read persisted history through the
+    // existing RPC and deliver it as the same WS snapshot shape.
+    match client
+        .get_flow_history(v1::GetFlowHistoryRequest {
+            flow_id: flow_id.clone(),
+        })
+        .await
+    {
+        Ok(response) => {
+            let history = response.into_inner();
+            Ok(ActiveHistory {
+                flow_id: history.flow_id,
+                service_id: history.service_id,
+                protocol_id: history.protocol_id,
+                opened_at_ms: history.opened_at_ms,
+                active: false,
+                pending: false,
+                segments: history.segments.into_iter().map(convert_segment).collect(),
+                truncated_client_to_server: history.truncated_client_to_server,
+                truncated_server_to_client: history.truncated_server_to_client,
+                retained_client_to_server_bytes: history.bytes_client_to_server,
+                retained_server_to_client_bytes: history.bytes_server_to_client,
+                reset: true,
+                client_sequence: 0,
+                server_sequence: 0,
+                client_head_dropped: 0,
+                server_head_dropped: 0,
+                generated_at_ms: crate::modules::auth::now().saturating_mul(1000),
+            })
+        }
+        Err(status) => {
+            tracing::warn!(
+                request_id = %request_id,
+                flow_id = %flow_id,
+                grpc_code = status.code() as i32,
+                "closed history read failed"
+            );
+            Err(match status.code() {
+                tonic::Code::FailedPrecondition => HistoryFailure::Pending,
+                tonic::Code::NotFound => HistoryFailure::NotFound,
+                _ => HistoryFailure::Unavailable("history_unavailable"),
+            })
+        }
     }
 }
 #[derive(Deserialize, ToSchema)]
