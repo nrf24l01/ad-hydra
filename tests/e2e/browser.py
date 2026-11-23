@@ -20,6 +20,14 @@ from unittest.mock import patch
 from relay import BIN, port
 
 
+# TrafficPage renders the live label as the status paragraph's own text node and
+# appends counters in a separate child span ("Live · 0 open · 0 seen · 0
+# messages"), so whole-element textContent never equals 'Live'. Match only the
+# primary text node; it is 'Reconnecting live traffic…' while retrying, so this
+# stays an exact connection-state check without accepting the counters suffix.
+TRAFFIC_LIVE_EXPRESSION="document.querySelector('#traffic-live-status')?.firstChild?.textContent?.trim()==='Live'"
+
+
 def browser_binary():
     # Hosted runners also install an unpinned Chromium snapshot. Match the
     # workflow's stable Chrome preference while retaining local Chromium support.
@@ -93,10 +101,18 @@ class CDP:
     def click(self, expression):
         # Select menus can be taller than their scroll viewport. Wait for the
         # target to finish scrolling before calculating its mouse coordinates;
-        # otherwise a smooth-scroll race can click a neighboring option.
-        point=self.evaluate(f'(async()=>{{const e=({expression});e.scrollIntoView({{block:"center",behavior:"instant"}});await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));const r=e.getBoundingClientRect();return {{x:r.x+r.width/2,y:r.y+r.height/2}}}})()')
+        # otherwise a smooth-scroll race can click a neighboring option. A live
+        # WebSocket frame can also replace the surrounding panel between the
+        # coordinate read and the dispatched event, which silently loses the
+        # click (reka-ui keeps aria-expanded=false); re-resolve the element and
+        # confirm it is the hit-test target before dispatching.
+        for _ in range(40):
+            point=self.evaluate(f'(async()=>{{const e=({expression});if(!e)return null;e.scrollIntoView({{block:"center",behavior:"instant"}});await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));const r=e.getBoundingClientRect();const x=r.x+r.width/2,y=r.y+r.height/2;const hit=document.elementFromPoint(x,y);return {{x,y,ok:Boolean(hit)&&(hit===e||e.contains(hit)||hit.contains(e))}}}})()')
+            if point and point['ok']:break
+            time.sleep(.05)
+        else:raise AssertionError(f'click target never became hit-testable: {expression}')
         for kind in ['mousePressed','mouseReleased']:
-            self.call('Input.dispatchMouseEvent',{'type':kind,**point,'button':'left','clickCount':1})
+            self.call('Input.dispatchMouseEvent',{'type':kind,'x':point['x'],'y':point['y'],'button':'left','clickCount':1})
 
 
 class Browser(unittest.TestCase):
@@ -110,6 +126,10 @@ class Browser(unittest.TestCase):
         retry_backend_stop = threading.Event()
         with tempfile.TemporaryDirectory(prefix='hydra-browser-') as directory:
             tmp = pathlib.Path(directory)
+            # Screenshots are debug artifacts of this smoke test. Keep them inside
+            # the test-owned fixture directory instead of shared /tmp paths.
+            artifacts = tmp / 'artifacts'
+            artifacts.mkdir()
             ap, debug = port(), port()
             sock = str(tmp / 'proxy.sock')
             (tmp / 'proxy.json').write_text(json.dumps({'socket': sock, 'state_file': str(tmp / 'saved.json'), 'flag_pattern':'FLAG[0-9]{6}','limits':{'udp_idle_ms':250}}))
@@ -175,6 +195,20 @@ class Browser(unittest.TestCase):
                             return
                         time.sleep(.05)
                     self.fail(cdp.evaluate("'Controls: '+JSON.stringify([...document.querySelectorAll('[role=combobox]')].map(e=>e.outerHTML))+'\\n'+document.body.innerText+'\\nEditors: '+[...document.querySelectorAll('[role=textbox]')].map(e=>e.outerHTML).join('\\n')+'\\nTextareas: '+[...document.querySelectorAll('textarea')].map(e=>e.outerHTML).join('\\n')"))
+                def open_select(trigger,label,seconds=8):
+                    # reka-ui Select opens on the trigger's pointerdown; a
+                    # concurrent panel re-render can swallow a single click and
+                    # leave aria-expanded=false, so retry the trigger until the
+                    # option list is actually open (the caller still asserts and
+                    # clicks the exact option).
+                    option=f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].some(e=>e.textContent.trim()==={json.dumps(label)})"
+                    deadline=time.time()+seconds
+                    while time.time()<deadline:
+                        if cdp.evaluate(option):return
+                        if not cdp.evaluate("Boolean(document.querySelector('[role=listbox][data-state=open]'))"):
+                            cdp.click(trigger)
+                        time.sleep(.15)
+                    self.fail(f'select option {label!r} never opened from {trigger}')
                 def replace_editor(selector, value):
                     cdp.click(f"document.querySelector({json.dumps(selector)})")
                     cdp.call('Input.dispatchKeyEvent',{'type':'keyDown','key':'Control','code':'ControlLeft','modifiers':2})
@@ -255,7 +289,7 @@ class Browser(unittest.TestCase):
                 cdp.call('Input.dispatchKeyEvent',{'type':'keyDown','key':'Escape','code':'Escape','windowsVirtualKeyCode':27})
                 cdp.call('Input.dispatchKeyEvent',{'type':'keyUp','key':'Escape','code':'Escape','windowsVirtualKeyCode':27})
                 wait("!document.querySelector('#service-form')")
-                pathlib.Path('/tmp/hydra-services-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
+                (artifacts / 'hydra-services-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
                 wait("document.querySelectorAll('[aria-label=\"Live service metrics\"] svg').length>=4", seconds=10)
                 wait("document.querySelector('[aria-label=\"Live service metrics\"]')?.innerText.includes('Live · every 2 seconds')", seconds=10)
                 # Hold a loopback port through a real listener bind failure,
@@ -321,7 +355,7 @@ class Browser(unittest.TestCase):
                 cdp.click("[...document.querySelectorAll('[role=dialog] button')].find(e=>e.textContent==='Save color')")
                 wait("!document.querySelector('[role=dialog]')")
                 cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                wait("document.querySelector('#traffic-live-status')?.textContent==='Live'")
+                wait(TRAFFIC_LIVE_EXPRESSION)
                 cdp.click("document.querySelector('#traffic-service')")
                 wait("document.querySelectorAll('[role=listbox][data-state=open] [role=option]').length===3")
                 cdp.click("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==="+json.dumps(service['name'])+")")
@@ -354,7 +388,7 @@ class Browser(unittest.TestCase):
                 self.assertFalse(cdp.evaluate("Boolean(document.querySelector('#traffic-stream [data-http-body] b'))"))
                 cdp.click("[...document.querySelectorAll('#traffic-stream button')].find(b=>b.textContent==='Text')")
                 self.assertEqual(cdp.evaluate("document.querySelector('#traffic-stream [data-direction=\"2\"] [data-http-body]').textContent"),http_body.decode())
-                pathlib.Path('/tmp/hydra-http-view-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
+                (artifacts / 'hydra-http-view-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
                 cdp.click("document.querySelector('#traffic-sessions [aria-label=\"Save stream in favourites\"]')")
                 wait("document.querySelector('#traffic-sessions [aria-label=\"Remove stream from favourites\"]')?.getAttribute('aria-pressed')==='true'")
                 cdp.click("document.querySelector('#traffic-favourites-only')")
@@ -509,7 +543,7 @@ class Browser(unittest.TestCase):
                         source_file_node = cdp.call('DOM.querySelector',{'nodeId':document,'selector':'#page input[type="file"]'})['nodeId']
                         cdp.call('DOM.setFileInputFiles',{'nodeId':source_file_node,'files':[str(uploaded_script)]})
                         wait("(()=>{const editor=document.querySelector('#checker-source-input');const surface=editor?.closest('.cm-editor');return editor?.getAttribute('role')==='textbox' && editor.innerText.includes('UTF-8 marker: Ω 🚩') && surface?.querySelector('.cm-gutters .cm-lineNumbers') && getComputedStyle(surface).backgroundColor==='rgb(0, 0, 0)' && [...editor.querySelectorAll('.cm-line span')].some(token=>getComputedStyle(token).color!==getComputedStyle(editor).color)})()")
-                        pathlib.Path('/tmp/hydra-python-checker-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
+                        (artifacts / 'hydra-python-checker-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
                         cdp.evaluate("window.__checkerProgramsRead=Promise.resolve(null);const fetchBeforeCheckerCapture=window.fetch;window.fetch=async(...args)=>{const response=await fetchBeforeCheckerCapture(...args);if(String(args[0]).endsWith('/api/v1/filters/request-checkers/programs')&&(!args[1]?.method||args[1].method==='GET'))window.__checkerProgramsRead=response.clone().json();return response}")
                         cdp.click("[...document.querySelectorAll('#page button')].find(b=>b.textContent.trim()==='Create paused checker')")
                         wait("document.querySelector('#page').innerText.includes('browser-managed') && [...document.querySelectorAll('#page button')].some(b=>b.textContent.trim()==='Edit source')")
@@ -645,7 +679,7 @@ class Browser(unittest.TestCase):
                             blocked.sendall(b'GET /blocked-browser HTTP/1.1\r\nHost: browser-fixture\r\nConnection: close\r\n\r\n')
                             self.assertIn(b'402',blocked.recv(4096))
                         cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                        wait("document.querySelector('#traffic-live-status')?.textContent==='Live' && Boolean(document.querySelector('#traffic-sessions [data-flow-id]'))")
+                        wait(TRAFFIC_LIVE_EXPRESSION + " && Boolean(document.querySelector('#traffic-sessions [data-flow-id]'))")
                         self.assertFalse(cdp.evaluate("Boolean(document.querySelector('#traffic-sessions [data-blocked=\"true\"]'))"))
                         cdp.click("document.querySelector('#traffic-show-blocked')")
                         wait("Boolean(document.querySelector('#traffic-sessions [data-blocked=\"true\"]'))")
@@ -746,11 +780,17 @@ class Browser(unittest.TestCase):
                                 n=len(marker);protobuf=b'\x0a'+bytes([(n&127)|128,n>>7])+marker
                                 grpc=b'\x00'+len(protobuf).to_bytes(4,'big')+protobuf
                                 response_bytes=h2frame(4,0,0,b'')+h2frame(1,4,1,b'\x88')+h2frame(0,1,1,grpc)
-                                expected_output='crypter.GetUserPublicKeyResponse.n: WASM_DECODED_RESPONSE_'
+                                expected_field_key='crypter.GetUserPublicKeyResponse.n'
+                                expected_field_type=None
+                                expected_payload=None
                             else:
                                 request_bytes=b'\x00\x04PING'
                                 response_bytes=len(marker).to_bytes(2,'big')+marker
-                                expected_output='protocol.payload:'
+                                # The decoder strips the u16 length prefix, so the
+                                # decoded bytes field is exactly the marker payload.
+                                expected_field_key='protocol.payload'
+                                expected_field_type='bytes'
+                                expected_payload=list(response_bytes[2:])
                             def decoder_reply():
                                 try:
                                     peer,_=decoder_backend.accept()
@@ -769,7 +809,7 @@ class Browser(unittest.TestCase):
                                 activation=db.execute("SELECT service_id,protocol_id,version,applied FROM protocol_activations WHERE protocol_id='browser-wasm'").fetchone()
                                 self.assertEqual(activation[1:],('browser-wasm','v1',1));module_service_id=activation[0]
                             cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                            wait("document.querySelector('#traffic-live-status')?.textContent==='Live'")
+                            wait(TRAFFIC_LIVE_EXPRESSION)
                             cdp.click("document.querySelector('#traffic-service')")
                             wait("document.querySelectorAll('[role=listbox][data-state=open] [role=option]').length>2")
                             cdp.click(f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==={json.dumps(new_module_service['name'])})")
@@ -777,12 +817,28 @@ class Browser(unittest.TestCase):
                                 peer.sendall(request_bytes);received=b''
                                 while len(received)<len(response_bytes):received+=peer.recv(4096)
                                 self.assertEqual(received,response_bytes)
-                            # Both directions expose protocol.payload in the generic
-                            # decoder. A rendered request does not imply that the
-                            # asynchronously delivered response has rendered yet.
-                            wait(f"[...document.querySelectorAll('#traffic-stream [data-direction=\"2\"]')].some(e=>e.innerText.includes({json.dumps(expected_output)}))")
+                            # Core's display summary deliberately omits binary fields,
+                            # so the server frame's visible text is only its protocol
+                            # and message type. The decoded bytes are still part of the
+                            # contract: read them from the Inspect fields table.
+                            wait("Boolean(document.querySelector('#traffic-stream [data-direction=\"2\"]'))")
                             self.assertEqual(cdp.evaluate("document.querySelector('[aria-label=\"Stream view\"]').textContent"),'Decoded conversation')
-                            self.assertTrue(cdp.evaluate("Boolean(document.querySelector('#traffic-stream [data-direction=\"2\"]'))"))
+                            server_card="[...document.querySelectorAll('#traffic-stream [data-direction=\"2\"]')].at(-1)"
+                            if expected_payload is None:
+                                self.assertIn('WASM_DECODED_RESPONSE_',cdp.evaluate(f"{server_card}.innerText"))
+                            else:
+                                server_summary=cdp.evaluate(f"{server_card}.innerText")
+                                self.assertIn('length-prefixed',server_summary)
+                                self.assertIn('frame',server_summary)
+                            cdp.evaluate(f"[...({server_card}).querySelectorAll('button')].find(b=>b.textContent==='Inspect fields').click()")
+                            wait(f"Boolean(({server_card}).querySelector('table tbody tr'))")
+                            inspected=cdp.evaluate(f"[...({server_card}).querySelectorAll('table tbody tr')].map(r=>[...r.cells].map(c=>c.textContent))")
+                            field_row=next((row for row in inspected if row[0]==expected_field_key),['','',''])
+                            self.assertNotEqual(field_row[0],'',f'{expected_field_key} is missing from the Inspect fields table: {inspected}')
+                            if expected_field_type is not None:self.assertEqual(field_row[1],expected_field_type)
+                            decoded_payload=json.loads(field_row[2])
+                            if expected_payload is None:self.assertIn('WASM_DECODED_RESPONSE_',decoded_payload)
+                            else:self.assertEqual(decoded_payload,expected_payload)
                             cli_credentials=tmp/'deploy-credentials.json'
                             cli_credentials.write_text(json.dumps({'username':'alice','password':'test-password-1234'}));cli_credentials.chmod(0o600)
                             result=subprocess.run(['python3',str(root/'scripts/deploy-protocol-remote.py'),str(module),'--id','browser-wasm','--version','script-v2','--service',module_service_id,'--origin',f'https://localhost:{ap}','--ca',str(tmp/'tls.crt'),'--credentials',str(cli_credentials)],check=True,capture_output=True,text=True,timeout=30)
@@ -802,7 +858,7 @@ class Browser(unittest.TestCase):
                         self.assertEqual(cdp.evaluate("document.querySelector('#submitter-forcad-token').value"),'')
                         self.assertEqual(cdp.evaluate("document.querySelector('#submitter-forcad-token').placeholder"),'Saved token; leave blank to keep it')
                         self.assertNotIn('browser-write-only-token',cdp.evaluate("document.querySelector('#page').innerText"))
-                        pathlib.Path('/tmp/hydra-forcad-submit-ui.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'} )['data']))
+                        (artifacts / 'hydra-forcad-submit-ui.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'} )['data']))
                         cdp.evaluate("{const e=document.querySelector('#submitter-forcad-port');e.value='8081';e.dispatchEvent(new Event('input',{bubbles:true}));}")
                         cdp.click("[...document.querySelectorAll('#page button')].find(button=>button.textContent==='Save submitter')")
                         wait("document.querySelector('#page').innerText.includes('Submitter configuration saved.')")
@@ -815,7 +871,7 @@ class Browser(unittest.TestCase):
                         custom_source = '# Submitter UTF-8: λ 🚩\n\nimport sys\n\nflags = sys.argv[1:]\n'
                         replace_editor('#submitter-code',custom_source)
                         wait("document.querySelector('#submitter-code')?.innerText.includes('Submitter UTF-8: λ 🚩') && document.querySelector('#submitter-code')?.innerText.includes('flags = sys.argv[1:]')")
-                        pathlib.Path('/tmp/hydra-submitter-editor.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
+                        (artifacts / 'hydra-submitter-editor.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
                         cdp.evaluate("window.__submitterSaveGate=new Promise(resolve=>window.__releaseSubmitterSave=resolve);const originalFetch=window.fetch;window.fetch=async(...args)=>{if(String(args[0]).endsWith('/api/v1/submitter')&&args[1]?.method==='PUT'){window.fetch=originalFetch;await window.__submitterSaveGate;}return originalFetch(...args)}")
                         cdp.click("[...document.querySelectorAll('#page button')].find(button=>button.textContent==='Save submitter')")
                         wait("document.querySelector('#submitter-code').getAttribute('aria-disabled')==='true' && document.querySelector('#submitter-code').getAttribute('contenteditable')==='false'")
@@ -844,14 +900,14 @@ class Browser(unittest.TestCase):
                         self.assertFalse(cdp.evaluate("[...document.querySelectorAll('#page table th')].some(e=>e.textContent==='Digest')"))
                         cdp.evaluate("(()=>{const button=[...document.querySelectorAll('#page button[aria-expanded]')].find(b=>b.innerText.trim().startsWith('Flags'));if(button?.getAttribute('aria-expanded')==='false')button.click()})()")
                         wait("Boolean(document.querySelector('[aria-label=\"Flags per page\"]'))")
-                        cdp.click("document.querySelector('[aria-label=\"Sort flags\"]')")
+                        open_select("document.querySelector('[aria-label=\\\"Sort flags\\\"]')",'Flag text')
                         wait("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].some(e=>e.textContent.trim()==='Flag text')")
                         cdp.click("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==='Flag text')")
-                        cdp.click("document.querySelector('[aria-label=\"Flag sort order\"]')")
+                        open_select("document.querySelector('[aria-label=\\\"Flag sort order\\\"]')",'Ascending')
                         wait("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].some(e=>e.textContent.trim()==='Ascending')")
                         cdp.click("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==='Ascending')")
                         wait("document.querySelector('#page').innerText.includes('FLAG001000')")
-                        cdp.click("document.querySelector('[aria-label=\"Flags per page\"]')")
+                        open_select("document.querySelector('[aria-label=\\\"Flags per page\\\"]')",'25')
                         wait("document.querySelectorAll('[role=listbox][data-state=open] [role=option]').length===4")
                         cdp.click("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==='25')")
                         wait("[...document.querySelectorAll('#page table')].find(t=>[...t.querySelectorAll('th')].some(h=>h.textContent==='Flag'))?.querySelectorAll('tbody tr').length===25")
@@ -887,7 +943,7 @@ class Browser(unittest.TestCase):
                     with sqlite3.connect(tmp/'db') as database:
                         nc_id=next(item['id'] for item in json.loads(database.execute('SELECT services FROM control_state').fetchone()[0]) if item['listen_address']==nc_service['listen_address'])
                     cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                    wait("document.querySelector('#traffic-live-status')?.textContent==='Live'")
+                    wait(TRAFFIC_LIVE_EXPRESSION)
                     with socket.create_connection(('127.0.0.1',int(nc_service['listen_address'].split(':')[1])),timeout=5) as nc_client:
                         nc_client.settimeout(5);self.assertIn(b'Name:',nc_client.recv(128))
                         selector=f'#traffic-sessions [data-service-id="{nc_id}"]'
@@ -906,15 +962,21 @@ class Browser(unittest.TestCase):
                         wait("getComputedStyle(document.querySelector('#traffic-terminal .xterm-scrollable-element')).backgroundColor==='rgb(21, 21, 21)'")
                         cdp.click("document.querySelector('#theme-toggle')")
                         wait("getComputedStyle(document.querySelector('#traffic-terminal .xterm-scrollable-element')).backgroundColor==='rgb(0, 0, 0)'")
-                        pathlib.Path('/tmp/hydra-terminal-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
+                        (artifacts / 'hydra-terminal-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
                         terminal_done.set()
                     wait("document.querySelector('#traffic-stream').innerText.includes('Closed')")
                     wait("document.querySelector('#traffic-terminal')?.innerText.includes('Welcome, é!') && document.querySelector('#traffic-terminal')?.innerText.includes('[ff]')")
                     for label in ['Decoded conversation','Captured bytes','Stream · terminal']:
-                        cdp.click("document.querySelector('[aria-label=\"Stream view\"]')")
+                        open_select("document.querySelector('[aria-label=\\\"Stream view\\\"]')",label)
                         wait(f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].some(e=>e.textContent.trim()==={json.dumps(label)})")
                         cdp.click(f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==={json.dumps(label)})")
-                        if label=='Decoded conversation':wait("document.querySelector('#traffic-stream').innerText.includes('utf8.text:')")
+                        if label=='Decoded conversation':
+                            # Core now ships a display_text summary, so the card shows
+                            # the decoded text rather than the old `field: value`
+                            # fallback; the typed field is still exposed in Inspect.
+                            wait("document.querySelector('#traffic-stream').innerText.includes('Name: ')")
+                            cdp.evaluate("(()=>{const card=document.querySelector('#traffic-stream article[data-direction]');[...card.querySelectorAll('button')].find(b=>b.textContent==='Inspect fields').click()})()")
+                            wait("[...document.querySelectorAll('#traffic-stream article[data-direction] table tbody tr')].some(r=>r.cells[0]?.textContent==='utf8.text')")
                         elif label=='Captured bytes':wait("document.querySelector('#traffic-stream').innerText.includes('1b 5b 33 32')")
                         else:wait("document.querySelector('#traffic-terminal')?.innerText.includes('Welcome, é!')")
                 # A new raw TCP history keeps cross-direction read order and
@@ -954,7 +1016,7 @@ class Browser(unittest.TestCase):
                     with sqlite3.connect(tmp/'db') as database:
                         ordered_id=next(item['id'] for item in json.loads(database.execute('SELECT services FROM control_state').fetchone()[0]) if item['listen_address']==ordered_service['listen_address'])
                     cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                    wait("document.querySelector('#traffic-live-status')?.textContent==='Live'")
+                    wait(TRAFFIC_LIVE_EXPRESSION)
                     cdp.click("document.querySelector('#traffic-service')")
                     wait(f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].some(e=>e.textContent.trim()==={json.dumps(ordered_service['name'])})")
                     cdp.click(f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==={json.dumps(ordered_service['name'])})")
@@ -975,7 +1037,7 @@ class Browser(unittest.TestCase):
                     decoded=cdp.evaluate("[...document.querySelectorAll('#traffic-stream article[data-direction]')].map(e=>[e.dataset.direction,e.querySelector('pre')?.textContent])")
                     self.assertEqual(decoded,[['1','A'],['2','B'],['1','éC'],['2','D']])
                     self.assertIn('chunk #1',cdp.evaluate("document.querySelector('#traffic-stream').innerText"))
-                    pathlib.Path('/tmp/hydra-ordered-raw-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
+                    (artifacts / 'hydra-ordered-raw-desktop.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['data']))
                     cdp.click("document.querySelector('[aria-label=\"Stream view\"]')")
                     wait("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].some(e=>e.textContent.trim()==='Captured bytes')")
                     cdp.click("[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==='Captured bytes')")
@@ -1012,29 +1074,43 @@ class Browser(unittest.TestCase):
                     }})()""")
                     self.assertEqual(profile_update['status'],202,profile_update)
                     self.assertEqual(profile_update['protocol_id'],'utf8',profile_update)
+                    # Traffic rows, selection metadata and flow hydration now arrive
+                    # over the live WebSocket, so the lost-closure fault is injected
+                    # at the message boundary for this exact flow only. The native
+                    # socket class is subclassed: auth/control frames, OPEN
+                    # constants, send/close and the prototype stay untouched; a
+                    # changed frame is redispatched once (guarded by `changed`).
+                    # The existing Page.reload above already cleared the older
+                    # in-page probes; there is no HTTP flow path to patch anymore.
                     lost_closure_script=f"""(()=>{{
                       const targetFlow={json.dumps(ordered_flow_id)};
-                      const originalFetch=window.fetch.bind(window);
+                      const NativeSocket=window.WebSocket;
                       window.__lostClosureFixtureApplied=false;
-                      window.fetch=async(...args)=>{{
-                        const response=await originalFetch(...args);
-                        const url=new URL(typeof args[0]==='string'?args[0]:args[0].url,location.href);
-                        if(!url.pathname.startsWith('/api/v1/traffic/flows')||url.pathname.endsWith('/history'))return response;
-                        const body=await response.clone().json();let changed=false;
-                        const stripClosed=item=>{{if(item?.flow_id===targetFlow&&Object.hasOwn(item,'closed')){{delete item.closed;changed=true}}}};
-                        if(Array.isArray(body.items))body.items.forEach(stripClosed);
-                        if(url.pathname.endsWith('/'+targetFlow))stripClosed(body);
-                        if(!changed)return response;
-                        window.__lostClosureFixtureApplied=true;
-                        const headers=new Headers(response.headers);headers.delete('content-length');
-                        return new Response(JSON.stringify(body),{{status:response.status,statusText:response.statusText,headers}});
-                      }};
+                      class LostClosureSocket extends NativeSocket {{
+                        constructor(...args){{
+                          super(...args);
+                          this.addEventListener('message',event=>{{
+                            const data=event.data;
+                            if(typeof data!=='string'||!data.includes(targetFlow))return;
+                            let frame;try{{frame=JSON.parse(data)}}catch{{return}}
+                            let changed=false;
+                            const stripClosed=item=>{{if(item&&typeof item==='object'&&item.flow_id===targetFlow&&Object.hasOwn(item,'closed')){{delete item.closed;changed=true}}}};
+                            if(Array.isArray(frame.items))frame.items.forEach(stripClosed);
+                            stripClosed(frame.flow);
+                            if(!changed)return;
+                            event.stopImmediatePropagation();
+                            window.__lostClosureFixtureApplied=true;
+                            this.dispatchEvent(new MessageEvent('message',{{data:JSON.stringify(frame)}}));
+                          }},true);
+                        }}
+                      }}
+                      window.WebSocket=LostClosureSocket;
                     }})()"""
                     cdp.call('Page.reload')
                     wait("document.querySelector('#console') && !document.querySelector('#console').hidden")
                     cdp.evaluate(lost_closure_script)
                     cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                    wait("document.querySelector('#traffic-live-status')?.textContent==='Live'")
+                    wait(TRAFFIC_LIVE_EXPRESSION)
                     cdp.click("document.querySelector('#traffic-service')")
                     wait(f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].some(e=>e.textContent.trim()==={json.dumps(ordered_service['name'])})")
                     cdp.click(f"[...document.querySelectorAll('[role=listbox][data-state=open] [role=option]')].find(e=>e.textContent.trim()==={json.dumps(ordered_service['name'])})")
@@ -1074,7 +1150,7 @@ class Browser(unittest.TestCase):
                     udp_service={**service,'name':'Browser UDP','transport':'udp','protocol_id':'utf8','listen_address':f'127.0.0.1:{port()}','upstream_address':f'127.0.0.1:{udp_backend.getsockname()[1]}'}
                     fill_service(udp_service)
                     cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                    wait("document.querySelector('#traffic-live-status')?.textContent==='Live'")
+                    wait(TRAFFIC_LIVE_EXPRESSION)
                     threading.Thread(target=udp_reply,daemon=True).start()
                     with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp_client:
                         udp_client.settimeout(3);udp_client.sendto(b'UDP browser request',('127.0.0.1',int(udp_service['listen_address'].split(':')[1])))
@@ -1094,7 +1170,7 @@ class Browser(unittest.TestCase):
                     self.assertNotIn('Saved stream history is temporarily unavailable',saved)
                 # Proxy disconnect is a real child-process stop, with Core/UI live.
                 cdp.evaluate("[...document.querySelectorAll('nav button')].find(b=>b.textContent==='Traffic').click()")
-                wait("document.querySelector('#traffic-live-status')?.textContent==='Live'")
+                wait(TRAFFIC_LIVE_EXPRESSION)
                 processes[0].terminate();processes[0].wait(timeout=10)
                 wait("document.querySelector('#hydra-header').dataset.proxyConnected==='false'",seconds=12)
                 self.assertTrue(cdp.evaluate("document.querySelector('#hydra-header').classList.contains('bg-red-950')"))

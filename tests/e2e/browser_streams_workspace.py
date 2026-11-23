@@ -12,6 +12,12 @@ Proven here:
     list, the selected flow and global search all ride it, and after the first
     ``snapshot`` the page issues no ``GET /api/v1/traffic/...`` flows/messages/
     search/history request at all;
+  * the live indicator is judged on the real DOM rather than on a text prefix:
+    the status element's *own* text node is exactly ``Live`` while the appended
+    server counters live in a child ``<span>``, so the full status text reads
+    ``Live · N open · N seen · N messages`` and never equals ``Live`` alone.
+    The primary check is the shared ``browser.TRAFFIC_LIVE_EXPRESSION``
+    predicate, not a local ``startsWith('Live')``;
   * selecting the still-open flow renders live capture bytes: a byte burst
     written to the upstream *after* selection appears in the read-only
     terminal, and the page received ``active_bytes`` for that flow;
@@ -62,7 +68,7 @@ import time
 import unittest
 
 from relay import BIN, port
-from browser import CDP, browser_binary
+from browser import CDP, TRAFFIC_LIVE_EXPRESSION, browser_binary
 from streams_workspace import read_exact
 
 FIRST_PAGE = 100
@@ -79,6 +85,18 @@ LIVE_MARKER = 'live-bytes-synthetic-42'
 HTML_PROBE = '<img src=x onerror="window.__xss=1"><b>literal</b>'
 WS_PATH = '/api/v1/traffic/events/socket'
 TRAFFIC_POLL = re.compile(r'/api/v1/traffic/(flows|messages|search|history)')
+
+# The real DOM split behind ``TRAFFIC_LIVE_EXPRESSION``: the element's own
+# first child is the primary state text node, the server counters are the
+# single child ``<span>`` appended by ``TrafficPage.vue``.
+LIVE_STATUS_FACTS = (
+    "(()=>{const s=document.querySelector('#traffic-live-status');"
+    "if(!s)return null;const primary=s.firstChild;"
+    "const spans=[...s.querySelectorAll('span')];"
+    "return {primary:primary?primary.textContent:null,"
+    "primaryIsText:Boolean(primary)&&primary.nodeType===3,"
+    "text:s.textContent,inner:s.innerText,"
+    "spans:spans.map(e=>e.textContent)};})()")
 
 
 def js(value):
@@ -523,8 +541,50 @@ class StreamsWorkspaceBrowser(unittest.TestCase):
                 wait_js("Boolean(document.querySelector('#traffic-sessions'))",
                         context='traffic workspace')
                 self.assertEqual(cdp.evaluate('location.hash'), '#/traffic')
-                wait_js("document.querySelector('#traffic-live-status')?.innerText"
-                        ".startsWith('Live')", context='live socket ready')
+                # Canonical primary predicate from ``browser.py``: the status
+                # element's own text node is exactly `Live`. A prefix match
+                # would also accept a stale/partial label; this does not.
+                wait_js(TRAFFIC_LIVE_EXPRESSION, context='live socket ready')
+
+                # ---- live label is the primary text node, counters a span ---
+                # The server emits a `counters` frame right after the snapshot
+                # (ws/subscribe.rs), so the span can appear a render after the
+                # socket reports live: wait for the rendered frame instead of
+                # reading a fixed slice.
+                if not wait_until(
+                        cdp,
+                        lambda: (lambda facts: bool(facts) and len(facts['spans']) == 1)(
+                            cdp.evaluate(LIVE_STATUS_FACTS)),
+                        20.0, 'rendered live counters span'):
+                    self.fail('the live status never rendered its counters child '
+                              f'span; status facts: {cdp.evaluate(LIVE_STATUS_FACTS)!r}')
+                live_facts = cdp.evaluate(LIVE_STATUS_FACTS)
+                self.assertTrue(
+                    cdp.evaluate(TRAFFIC_LIVE_EXPRESSION),
+                    'the canonical predicate must hold on the real primary text '
+                    f'node; status facts: {live_facts!r}')
+                self.assertTrue(
+                    live_facts['primaryIsText'],
+                    "the primary status text must be the element's own text node, "
+                    f'not a child element; status facts: {live_facts!r}')
+                self.assertEqual(
+                    live_facts['primary'], 'Live',
+                    'the primary status text node must be exactly "Live", got '
+                    f'{live_facts["primary"]!r}')
+                self.assertNotEqual(
+                    live_facts['text'], 'Live',
+                    'the full status must carry the counters, so it cannot equal '
+                    f'the primary label alone; status facts: {live_facts!r}')
+                self.assertRegex(
+                    live_facts['text'],
+                    r'^Live · \d+ open · \d+ seen · \d+ messages$',
+                    'the full status must be the Live label plus the server '
+                    f'counters, got {live_facts["text"]!r}')
+                self.assertRegex(
+                    live_facts['spans'][0],
+                    r'^ · \d+ open · \d+ seen · \d+ messages$',
+                    'the counters child span must carry the server counters, got '
+                    f'{live_facts["spans"]!r}')
 
                 # ---- the page's own socket is the only transport -------
                 created = cdp.since(0, 'Network.webSocketCreated')
@@ -805,8 +865,14 @@ class StreamsWorkspaceBrowser(unittest.TestCase):
                                         f'visible cycle, got {visited}')
                         self.assertEqual(cdp.evaluate('document.visibilityState'),
                                          'visible')
-                        self.assertIn('Live', cdp.evaluate(
-                            "document.querySelector('#traffic-live-status')?.innerText || ''"))
+                        # Same canonical primary predicate as the initial wait:
+                        # the resumed page must show the `Live` text node, not
+                        # merely contain the substring somewhere in its status.
+                        self.assertTrue(
+                            cdp.evaluate(TRAFFIC_LIVE_EXPRESSION),
+                            'after resume the primary status text node must be '
+                            'exactly "Live"; status facts: '
+                            f'{cdp.evaluate(LIVE_STATUS_FACTS)!r}')
                         # Core answers `resume` with a snapshot that echoes the
                         # resume request id (ws/commands.rs), so the bounded wait
                         # matches that exact reply. That counts only frames the
