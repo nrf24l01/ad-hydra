@@ -180,9 +180,44 @@ export class FakeClock {
   }
 }
 
-/** Install WebSocket + browser-ish globals the client derives its URL/auth from. */
-export function installBrowserGlobals(): void {
+/**
+ * The only globals this harness writes. Keep the list exhaustive and literal: the
+ * cleanup restores exactly these own properties, so adding a guessed browser global
+ * here (window, navigator, ...) would clobber ambient state the harness never owned.
+ * `fetch` and the fake timers are installed/restored separately (`installFetchStub`,
+ * `FakeClock`) because they are independent of the browser-global lifecycle.
+ */
+const browserGlobalNames = ['WebSocket', 'location', 'document'] as const
+
+type BrowserGlobalName = (typeof browserGlobalNames)[number]
+
+/**
+ * Own-property descriptors captured before the first install of this module.
+ *
+ * The live-socket suites call `installBrowserGlobals()` in every `beforeEach`, so a
+ * per-call capture would record the *previous fake* as the original and the cleanup
+ * would restore the leak instead of removing it. The snapshot is therefore taken once
+ * and reused until the cleanup runs; after that the next install captures afresh.
+ */
+let originalDescriptors: Map<BrowserGlobalName, PropertyDescriptor | undefined> | null = null
+
+/**
+ * Install WebSocket + browser-ish globals the client derives its URL/auth from.
+ *
+ * Returns an idempotent cleanup that restores every touched global's own property
+ * descriptor exactly as it was before the first install. Globals that did not exist
+ * before are deleted again, so a later test file that imports Vue (runtime-dom probes
+ * `document` at module scope and calls `doc.createElement`) sees the real environment
+ * rather than a partial fake.
+ */
+export function installBrowserGlobals(): () => void {
   const globals = globalThis as unknown as Record<string, unknown>
+  if (!originalDescriptors) {
+    originalDescriptors = new Map(
+      browserGlobalNames.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const),
+    )
+  }
+  const snapshot = originalDescriptors
   globals.WebSocket = FakeWebSocket
   globals.location = {
     protocol: 'https:',
@@ -201,6 +236,17 @@ export function installBrowserGlobals(): void {
     visibilityState: 'visible',
     addEventListener() {},
     removeEventListener() {},
+  }
+
+  return () => {
+    // Idempotent and stale-safe: only the install that still owns the snapshot restores,
+    // so calling the returned cleanup twice (or after a later install) is a no-op.
+    if (originalDescriptors !== snapshot) return
+    originalDescriptors = null
+    for (const [name, descriptor] of snapshot) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor)
+      else Reflect.deleteProperty(globalThis, name)
+    }
   }
 }
 

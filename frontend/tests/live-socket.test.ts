@@ -37,6 +37,7 @@ let clock: FakeClock
 const fetchCalls: FetchCall[] = []
 const originalFetch = globalThis.fetch
 let liveHandle: { close(): void } | undefined
+let restoreBrowserGlobals: (() => void) | undefined
 
 function socket(): FakeWebSocket {
   const current = FakeWebSocket.last
@@ -70,7 +71,7 @@ beforeEach(async () => {
   fetchCalls.length = 0
   clock = new FakeClock()
   clock.install()
-  installBrowserGlobals()
+  restoreBrowserGlobals = installBrowserGlobals()
   installFetchStub(fetchCalls)
   clear()
   await login('analyst', 'secret')
@@ -78,9 +79,16 @@ beforeEach(async () => {
 })
 
 afterAll(() => {
-  clock.uninstall()
-  globalThis.fetch = originalFetch
-  clear()
+  // Restore the browser globals first and unconditionally: a leaked partial `document`
+  // breaks every later test file that imports Vue, so the fake clock/fetch restores must
+  // still run even if the browser-global cleanup were to throw.
+  try {
+    restoreBrowserGlobals?.()
+  } finally {
+    clock.uninstall()
+    globalThis.fetch = originalFetch
+    clear()
+  }
 })
 
 test('opens one socket at the documented endpoint with the traffic subprotocol and no token in the URL', async () => {
